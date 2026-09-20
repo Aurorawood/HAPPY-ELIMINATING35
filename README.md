@@ -7,7 +7,10 @@
 1. 安装依赖
 ```bash
 pip install pygame
+```
 
 2.运行代码
+```bash
 python match3.py
+```
 
