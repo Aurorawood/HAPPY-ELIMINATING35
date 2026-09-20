@@ -34,8 +34,7 @@ except ImportError:
 COLS, ROWS = 8, 8          # 棋盘列数 / 行数
 TYPES = 6                  # 元素（动物）种类
 CELL = 54                  # 每格像素尺寸（格间留空隙）
-TILE = 48                  # 元素显示尺寸（= PIX_LOFI x 3，像素块整齐）
-PIX_LOFI = 16              # 元素低分辨率网格：16x16，再 3 倍最近邻放大
+TILE = 48                  # 元素显示尺寸
 WIN_W, WIN_H = 480, 720    # 窗口尺寸
 BOARD_X = (WIN_W - COLS * CELL) // 2
 BOARD_Y = 168
@@ -54,26 +53,22 @@ TYPE_COLORS = [
     ((150,  90, 200), ( 90,  40, 140)),  # 紫猫头鹰
 ]
 
-# ===== 复古像素色盘（深夜紫基调 + 鲜亮强调色）=====
-BG_COLOR = (26, 22, 54)          # 背景：深夜紫
-BOARD_BG = (32, 30, 66)          # 棋盘底
-BOARD_EDGE_LT = (128, 108, 255)  # 棋盘外亮边
-BOARD_EDGE_DK = (10, 8, 28)      # 棋盘外暗边
-PANEL_LIGHT = (244, 240, 255)    # 浅色面板底
-PANEL_EDGE = (22, 16, 48)        # 面板深色外框
-PANEL_HL = (255, 255, 255)       # 面板内高光
-PANEL_SH = (200, 190, 235)       # 面板内阴影
-TEXT_DARK = (54, 40, 110)        # 深紫文字
-TEXT_SOFT = (120, 104, 160)      # 次要文字
+# ===== 柔和糖果色盘（暖色渐变基调 + 圆润轻快）=====
+BG_TOP = (255, 236, 210)         # 背景渐变顶：奶油橙
+BG_BOTTOM = (255, 183, 200)      # 背景渐变底：樱花粉
+BOARD_BG = (255, 251, 245)       # 棋盘底：奶白
+BOARD_EDGE = (233, 160, 130)     # 棋盘描边：暖棕粉
+PANEL_LIGHT = (255, 255, 255)    # 浅色面板底
+PANEL_SH = (225, 185, 190)       # 面板底部阴影
+TEXT_DARK = (150, 80, 70)        # 主文字：暖棕红
+TEXT_SOFT = (205, 150, 140)      # 次要文字
 WHITE = (255, 255, 255)
-RED = (232, 58, 78)              # 重开按钮 / 步数
-PURPLE_BTN = (108, 82, 255)      # 主按钮
-PROGRESS_RED = (255, 92, 96)     # 进度填充
-PROGRESS_BG = (28, 32, 62)       # 进度槽底
-SELECT_COLOR = (255, 240, 110)   # 选中框：亮黄
-HINT_COLOR = (120, 230, 255)     # 提示框：亮青
-BG_TOP = BG_COLOR                # 兼容旧引用（渐变已取消）
-BG_BOTTOM = BG_COLOR
+RED = (255, 107, 107)            # 重开按钮 / 步数
+PURPLE_BTN = (156, 126, 240)     # 主按钮
+PROGRESS_RED = (255, 122, 89)    # 进度填充
+PROGRESS_BG = (240, 225, 228)    # 进度槽底
+SELECT_COLOR = (255, 196, 60)    # 选中框：暖黄
+HINT_COLOR = (90, 200, 255)      # 提示框：天青
 
 STATE_MENU = "menu"
 STATE_PLAY = "play"
@@ -504,7 +499,7 @@ class Particle:
         self.vy = math.sin(ang) * spd - 100
         self.max_life = random.uniform(0.45, 0.8)
         self.life = self.max_life
-        self.size = random.choice((3, 4, 6))   # 整数像素方块
+        self.size = random.uniform(2.0, 4.5)   # 圆形粒子半径
         self.color = color
 
 
@@ -520,18 +515,16 @@ class FloatText:
         self.life = self.max_life
 
 
-# ==================== 元素外观（像素风，基于 image/ 素材） ====================
+# ==================== 元素外观（基于 image/ 素材） ====================
 class ImageArt:
     """
-    像素管线（所有素材统一处理，保证风格一致）：
-      1. 50x50 原图平滑降采样到 16x16 低分辨率网格
-      2. 在 16x16 上用 1 像素粗的线条画特效标记（条纹 / 炸弹）
-      3. 3 倍最近邻放大到 48x48 —— 得到颗粒整齐的像素画
-    彩虹糖的旋转彩点在运行时以小方块动态绘制。
+    平滑素材管线：
+      1. 50x50 原图平滑缩放到 TILE(48)
+      2. 在全尺寸图上叠加特效标记（条纹 / 炸弹）
+    彩虹糖的旋转彩点在运行时动态绘制。
     """
 
-    UP = TILE                  # 最终像素图尺寸 48（LOFI x 3）
-    LOFI = PIX_LOFI            # 16
+    UP = TILE                  # 最终图尺寸 48
 
     def __init__(self, image_dir):
         self.dir = image_dir
@@ -552,10 +545,15 @@ class ImageArt:
                 self._imgs[special][True].append(
                     self._build(hi_bases[t], special))
 
-        # 进度条木框：同样像素化（152x18 → 456x54，3 倍）
+        # 进度条木框：平滑缩放到 HUD 尺寸
         proc = self._load("process.png", alpha=True)
-        small = pygame.transform.smoothscale(proc, (152, 18))
-        self.proc_frame = pygame.transform.scale(small, (456, 54))
+        self.proc_frame = pygame.transform.smoothscale(proc, (456, 54))
+
+        # 选中框 / 提示框素材（50x50 RGBA）
+        self.choose = pygame.transform.smoothscale(
+            self._load("choose.png", alpha=True), (CELL - 4, CELL - 4))
+        self.circle_choose = pygame.transform.smoothscale(
+            self._load("circle_choose.png", alpha=True), (CELL - 4, CELL - 4))
 
     def _load(self, name, alpha=False):
         path = os.path.join(self.dir, name)
@@ -566,33 +564,42 @@ class ImageArt:
         return img.convert_alpha() if alpha else img.convert()
 
     def _build(self, base, special):
-        """降采样 → 画特效 → 最近邻放大。"""
-        small = pygame.transform.smoothscale(base, (self.LOFI, self.LOFI))
+        """平滑缩放 → 画特效标记。"""
+        img = pygame.transform.smoothscale(
+            base, (self.UP, self.UP)).convert_alpha()
         if special in ("stripedH", "stripedV"):
+            mark = pygame.Surface((self.UP, self.UP), pygame.SRCALPHA)
             if special == "stripedH":
-                for yy in (3, 8, 13):
-                    pygame.draw.line(small, (255, 255, 255),
-                                     (1, yy), (14, yy), 1)
+                for yy in (8, 22, 36):
+                    pygame.draw.rect(mark, (255, 255, 255, 235),
+                                     (4, yy, self.UP - 8, 6),
+                                     border_radius=3)
             else:
-                for xx in (3, 8, 13):
-                    pygame.draw.line(small, (255, 255, 255),
-                                     (xx, 1), (xx, 14), 1)
+                for xx in (8, 22, 36):
+                    pygame.draw.rect(mark, (255, 255, 255, 235),
+                                     (xx, 4, 6, self.UP - 8),
+                                     border_radius=3)
+            img.blit(mark, (0, 0))
         elif special == "bomb":
-            # 深色 8x8 方块底 + 白色像素十字
-            pygame.draw.rect(small, (55, 15, 75), (4, 4, 8, 8))
-            pygame.draw.line(small, (255, 255, 255), (7, 5), (7, 10), 1)
-            pygame.draw.line(small, (255, 255, 255), (5, 7), (10, 7), 1)
-        return pygame.transform.scale(small, (self.UP, self.UP))
+            mark = pygame.Surface((self.UP, self.UP), pygame.SRCALPHA)
+            cx = self.UP // 2
+            pygame.draw.circle(mark, (90, 30, 110, 220), (cx, cx), 13)
+            pygame.draw.line(mark, (255, 255, 255, 255),
+                             (cx, cx - 8), (cx, cx + 8), 4)
+            pygame.draw.line(mark, (255, 255, 255, 255),
+                             (cx - 8, cx), (cx + 8, cx), 4)
+            img.blit(mark, (0, 0))
+        return img
 
     def scaled(self, gem, size, highlighted=False):
-        """最近邻放大（动画缩放时也保持硬边像素感），带缓存。"""
+        """平滑缩放（带缓存）。"""
         ck = (gem.special, gem.type, highlighted, size)
         img = self._scale_cache.get(ck)
         if img is None:
             # 彩虹糖无静态叠加（彩点运行时动态绘制），底图同普通版
             base_key = None if gem.special == "rainbow" else gem.special
             src = self._imgs[base_key][highlighted][gem.type]
-            img = pygame.transform.scale(src, (size, size))
+            img = pygame.transform.smoothscale(src, (size, size))
             self._scale_cache[ck] = img
         return img
 
@@ -655,61 +662,46 @@ class Game:
         self._start_gen(self._flow_init())
 
     def _render_background(self):
-        """深夜紫纯色底 + 固定种子的像素星点（稳定不闪烁）。"""
+        """暖色垂直渐变底 + 柔和半透明气泡装饰。"""
         surf = pygame.Surface((WIN_W, WIN_H))
-        surf.fill(BG_COLOR)
+        for y in range(WIN_H):
+            k = y / WIN_H
+            col = tuple(int(BG_TOP[i] + (BG_BOTTOM[i] - BG_TOP[i]) * k)
+                        for i in range(3))
+            pygame.draw.line(surf, col, (0, y), (WIN_W, y))
         rng = random.Random(20260920)
-        star_cols = ((255, 255, 255), (255, 240, 140),
-                     (160, 220, 255), (255, 150, 200))
-        for _ in range(52):
-            x = rng.randrange(0, WIN_W - 4, 2)
-            y = rng.randrange(0, WIN_H - 4, 2)
-            col = rng.choice(star_cols)
-            kind = rng.randrange(3)
-            if kind == 0:                                  # 单点
-                surf.set_at((x, y), col)
-            elif kind == 1:                                # 十字小星
-                for dx, dy in ((0, 0), (2, 0), (-2, 0), (0, 2), (0, -2)):
-                    surf.set_at((x + dx, y + dy), col)
-            else:                                          # 2x2 方块
-                surf.fill(col, (x, y, 2, 2))
+        bubbles = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        for _ in range(18):
+            x = rng.randrange(0, WIN_W)
+            y = rng.randrange(0, WIN_H)
+            r = rng.randrange(8, 26)
+            pygame.draw.circle(bubbles, (255, 255, 255, 26), (x, y), r)
+        surf.blit(bubbles, (0, 0))
         return surf
 
-    # ---------- 像素绘制基础组件（全部直角、整数坐标）----------
-    @staticmethod
-    def _box4(surf, x, y, w, h, color, t=3):
-        """用四块矩形拼出 t 像素厚的直角描边（比 border 参数更精确）。"""
-        pygame.draw.rect(surf, color, (x, y, w, t))                  # 上
-        pygame.draw.rect(surf, color, (x, y, t, h))                  # 左
-        pygame.draw.rect(surf, color, (x, y + h - t, w, t))          # 下
-        pygame.draw.rect(surf, color, (x + w - t, y, t, h))          # 右
+    # ---------- 圆角绘制基础组件 ----------
+    def _draw_panel(self, rect, fill=PANEL_LIGHT, radius=12):
+        """圆角浅色面板：底部柔和阴影 + 白色填充。"""
+        shadow = rect.move(0, 3)
+        pygame.draw.rect(self.screen, PANEL_SH, shadow,
+                         border_radius=radius)
+        pygame.draw.rect(self.screen, fill, rect, border_radius=radius)
 
-    def _pixel_panel(self, rect, fill=PANEL_LIGHT, edge=PANEL_EDGE, t=3):
-        """浅色面板：t 像素深色外框 + 填充 + 左上高光/右下阴影（2px）。"""
-        pygame.draw.rect(self.screen, edge, rect.inflate(2 * t, 2 * t))
-        pygame.draw.rect(self.screen, fill, rect)
-        pygame.draw.rect(self.screen, PANEL_HL,
-                         (rect.x, rect.y, rect.w, 2))
-        pygame.draw.rect(self.screen, PANEL_HL,
-                         (rect.x, rect.y, 2, rect.h))
-        pygame.draw.rect(self.screen, PANEL_SH,
-                         (rect.x, rect.y + rect.h - 2, rect.w, 2))
-        pygame.draw.rect(self.screen, PANEL_SH,
-                         (rect.x + rect.w - 2, rect.y, 2, rect.h))
+    def _draw_button(self, rect, fill, sh_c, radius=12):
+        """圆润按钮：底部深色边（立体感）+ 填充。"""
+        pygame.draw.rect(self.screen, sh_c, rect.move(0, 3),
+                         border_radius=radius)
+        pygame.draw.rect(self.screen, fill, rect, border_radius=radius)
 
-    def _pixel_button(self, rect, fill, hi_c, sh_c,
-                      edge=PANEL_EDGE, t=3):
-        """凸起像素按钮：深色外框 + 填充 + 左上亮边/右下暗边。"""
-        pygame.draw.rect(self.screen, edge, rect.inflate(2 * t, 2 * t))
-        pygame.draw.rect(self.screen, fill, rect)
-        pygame.draw.rect(self.screen, hi_c,
-                         (rect.x, rect.y, rect.w, t))
-        pygame.draw.rect(self.screen, hi_c,
-                         (rect.x, rect.y, t, rect.h))
-        pygame.draw.rect(self.screen, sh_c,
-                         (rect.x, rect.y + rect.h - t, rect.w, t))
-        pygame.draw.rect(self.screen, sh_c,
-                         (rect.x + rect.w - t, rect.y, t, rect.h))
+    def _blit_text_outline(self, font, text, color, outline, center,
+                           offset=2):
+        """带描边的文字（四方向偏移描边）。"""
+        base = font.render(text, True, color)
+        edge = font.render(text, True, outline)
+        rect = base.get_rect(center=center)
+        for dx, dy in ((-offset, 0), (offset, 0), (0, -offset), (0, offset)):
+            self.screen.blit(edge, rect.move(dx, dy))
+        self.screen.blit(base, rect)
 
     # ---------- 持久化 ----------
     def _load_best(self):
@@ -1207,12 +1199,9 @@ class Game:
         self.screen.blit(self._bg_surf, (0, 0))
 
     def _draw_hud(self):
-        # 标题：白色像素感标题 + 深色硬阴影（偏移 3px）
-        title_img = self.f_title.render("消 消 乐", True, WHITE)
-        tr = title_img.get_rect(center=(WIN_W // 2, 25))
-        shadow_img = self.f_title.render("消 消 乐", True, (0, 0, 0))
-        self.screen.blit(shadow_img, tr.move(3, 3))
-        self.screen.blit(title_img, tr)
+        # 标题：白色描边标题
+        self._blit_text_outline(self.f_title, "消 消 乐", WHITE,
+                                (222, 120, 110), (WIN_W // 2, 25))
 
         labels = ("关卡", "分数", "最佳", "步数")
         values = (str(self.level), str(self.score), str(self.best), str(self.moves))
@@ -1221,56 +1210,55 @@ class Game:
         x = 12
         for i in range(4):
             rect = pygame.Rect(int(x), 48, int(bw), 46)
-            self._pixel_panel(rect)
+            self._draw_panel(rect, radius=12)
             lb = self.f_stat_label.render(labels[i], True, TEXT_SOFT)
             self.screen.blit(lb, lb.get_rect(center=(rect.centerx, 60)))
-            vl = self.pix_render(values[i], 20, val_colors[i])
+            vl = self.f_stat_val.render(values[i], True, val_colors[i])
             self.screen.blit(vl, vl.get_rect(center=(rect.centerx, 80)))
             x += bw + 8
 
-        # 进度条（像素化木质框 + 直角内部填充）
+        # 进度条（木质框素材 + 圆角内部填充）
         p_x, p_y, p_w, p_h = 12, 100, WIN_W - 24, 54
         self.screen.blit(self.art.proc_frame, (p_x, p_y))
         in_x, in_y = p_x + 13, p_y + 14
         in_w, in_h = p_w - 26, 26
         pygame.draw.rect(self.screen, PROGRESS_BG,
-                         (in_x, in_y, in_w, in_h))
+                         (in_x, in_y, in_w, in_h), border_radius=in_h // 2)
         pct = max(0, min(1, (self.score - self.level_start_score) / self.target))
         if pct > 0:
             fw = max(in_h, int(in_w * pct))
             pygame.draw.rect(self.screen, PROGRESS_RED,
-                             (in_x, in_y, fw, in_h))
+                             (in_x, in_y, fw, in_h),
+                             border_radius=in_h // 2)
         tgt = self.f_small.render("目标 %d" % self.target, True, WHITE)
         self.screen.blit(tgt, tgt.get_rect(
             midright=(p_x + p_w - 20, p_y + p_h // 2)))
 
-    def _draw_select_box(self, cell, color, phase, corners=True):
-        """像素选中/提示框：3px 直角方框 + 四角白色脉冲块。"""
+    def _draw_select_box(self, cell, phase, hint=False):
+        """选中/提示框：素材图片 + 呼吸缩放脉动。"""
         r, c = cell
-        x = BOARD_X + c * CELL + 3
-        y = BOARD_Y + r * CELL + 3
-        w = h = CELL - 6
-        self._box4(self.screen, x, y, w, h, color, 3)
-        if corners:
-            cs = 4 if math.sin(phase) < 0 else 6      # 角块 4/6 两档跳动
-            half = cs // 2
-            for px, py in ((x, y), (x + w, y), (x, y + h), (x + w, y + h)):
-                pygame.draw.rect(self.screen, WHITE,
-                                 (px - half, py - half, cs, cs))
+        img = self.art.circle_choose if hint else self.art.choose
+        k = 1.0 + 0.06 * math.sin(phase)
+        size = int((CELL - 4) * k)
+        img2 = pygame.transform.smoothscale(img, (size, size))
+        self.screen.blit(img2, img2.get_rect(
+            center=(BOARD_X + c * CELL + CELL // 2,
+                    BOARD_Y + r * CELL + CELL // 2)))
 
     def _draw_board(self, now_ms):
-        # 棋盘：三层直角像素边框（外暗 6px / 亮紫 6px / 底色）
+        # 棋盘：圆角奶白底板 + 柔和外圈
         bg = pygame.Rect(BOARD_X, BOARD_Y, COLS * CELL, ROWS * CELL)
-        pygame.draw.rect(self.screen, BOARD_EDGE_DK, bg.inflate(12, 12))
-        pygame.draw.rect(self.screen, BOARD_EDGE_LT, bg.inflate(6, 6))
-        pygame.draw.rect(self.screen, BOARD_BG, bg)
-        # 每格直角小方块底
+        pygame.draw.rect(self.screen, BOARD_EDGE, bg.inflate(10, 10),
+                         border_radius=16)
+        pygame.draw.rect(self.screen, BOARD_BG, bg.inflate(4, 4),
+                         border_radius=12)
+        # 每格圆角小方块底
         for r in range(ROWS):
             for c in range(COLS):
-                pygame.draw.rect(self.screen, (42, 40, 82),
+                pygame.draw.rect(self.screen, (247, 236, 232),
                                  (BOARD_X + c * CELL + 2,
                                   BOARD_Y + r * CELL + 2,
-                                  CELL - 4, CELL - 4))
+                                  CELL - 4, CELL - 4), border_radius=8)
 
         hint_on = bool(self.hint and now_ms < self.hint[4])
         if self.hint and now_ms >= self.hint[4]:
@@ -1292,19 +1280,18 @@ class Game:
                 img = self.art.scaled(g, size, highlighted)
                 img.set_alpha(int(255 * g.alpha))
                 self.screen.blit(img, img.get_rect(center=(int(g.x), int(g.y))))
-                # 彩虹糖：六颗小方块彩点绕圈 + 白色中心方块
+                # 彩虹糖：六颗彩色圆点绕圈 + 白色中心圆点
                 if g.special == "rainbow":
                     dot = max(3, size // 12)
                     for i in range(6):
                         ang = now_ms / 500 + i * math.pi / 3
-                        px = int(g.x + math.cos(ang) * size * 0.30)
-                        py = int(g.y + math.sin(ang) * size * 0.30)
-                        pygame.draw.rect(self.screen, TYPE_COLORS[i][0],
-                                         (px, py, dot, dot))
-                    cd = int(dot * 1.5)
-                    pygame.draw.rect(self.screen, WHITE,
-                                     (int(g.x) - cd // 2,
-                                      int(g.y) - cd // 2, cd, cd))
+                        px = g.x + math.cos(ang) * size * 0.30
+                        py = g.y + math.sin(ang) * size * 0.30
+                        pygame.draw.circle(self.screen, TYPE_COLORS[i][0],
+                                           (int(px), int(py)), dot)
+                    pygame.draw.circle(self.screen, WHITE,
+                                       (int(g.x), int(g.y)),
+                                       int(dot * 1.2))
 
         # 光束（直角白色矩形）
         for d, i, life in self.beams:
@@ -1318,33 +1305,36 @@ class Game:
                 s.fill((255, 255, 255, alpha))
                 self.screen.blit(s, (BOARD_X + i * CELL + CELL // 2 - 8, BOARD_Y))
 
-        # 冲击波 → 像素方框扩散
+        # 冲击波 → 圆形扩散环
         for x, y, rad, life in self.waves:
-            rr = int(rad)
-            self._box4(self.screen, int(x) - rr, int(y) - rr,
-                       2 * rr, 2 * rr, WHITE, 3)
+            s = pygame.Surface((int(rad) * 2 + 8, int(rad) * 2 + 8),
+                               pygame.SRCALPHA)
+            pygame.draw.circle(s, (255, 255, 255, int(200 * life)),
+                               (s.get_width() // 2, s.get_height() // 2),
+                               int(rad), 4)
+            self.screen.blit(s, (int(x) - s.get_width() // 2,
+                                 int(y) - s.get_height() // 2))
 
-        # 粒子 → 像素方块（生命末期逐渐变暗）
+        # 粒子 → 圆形（生命末期逐渐变暗）
         for p in self.particles:
             k = max(0, p.life / p.max_life)
             col = tuple(int(ch * k + 40 * (1 - k)) for ch in p.color)
-            s = p.size
-            pygame.draw.rect(self.screen, col,
-                             (int(p.x), int(p.y), s, s))
+            pygame.draw.circle(self.screen, col,
+                               (int(p.x), int(p.y)), max(1, int(p.size)))
 
-        # 选中 / 提示像素框（画在元素上层）
+        # 选中 / 提示框（画在元素上层）
         if self.selected:
-            self._draw_select_box(self.selected, SELECT_COLOR, now_ms / 140)
+            self._draw_select_box(self.selected, now_ms / 140)
         if hint_on:
             for cell in hint_cells:
-                self._draw_select_box(cell, HINT_COLOR,
-                                      now_ms / 160, corners=False)
+                self._draw_select_box(cell, now_ms / 160, hint=True)
 
-        # 飘字（像素字 + 深色硬描边）
+        # 飘字（描边文字）
         for ft in self.floats:
             a = max(0, min(255, int(255 * min(1, ft.life * 1.6))))
-            img = self.pix_render(ft.text, ft.size, ft.color)
-            outline = self.pix_render(ft.text, ft.size, (58, 28, 100))
+            fnt = self.f_stat_val if ft.size <= 20 else self.f_panel_title
+            img = fnt.render(ft.text, True, ft.color)
+            outline = fnt.render(ft.text, True, (150, 80, 70))
             img.set_alpha(a)
             outline.set_alpha(a)
             rect = img.get_rect(center=(int(ft.x), int(ft.y)))
@@ -1352,61 +1342,28 @@ class Game:
                 self.screen.blit(outline, rect.move(dx, dy))
             self.screen.blit(img, rect)
 
-    def _sysfont(self, size, bold=False):
-        if not hasattr(self, "_font_cache"):
-            self._font_cache = {}
-        ck = (size, bold)
-        f = self._font_cache.get(ck)
-        if f is None:
-            f = pygame.font.SysFont("microsoftyahei,simhei", size, bold)
-            self._font_cache[ck] = f
-        return f
-
-    def pix_render(self, text, size, color, bold=True):
-        """
-        像素字渲染：
-          * 纯 ASCII（数字/英文）→ 半尺寸渲染后 2 倍最近邻放大，颗粒感强
-          * 含中文 → 全尺寸渲染，保证小字清晰可读
-        """
-        has_cjk = any("一" <= ch <= "鿿" for ch in text)
-        if has_cjk:
-            return self._sysfont(size, bold).render(text, True, color)
-        lo = max(8, size // 2)
-        s = self._sysfont(lo, bold).render(text, True, color)
-        return pygame.transform.scale(
-            s, (s.get_width() * 2, s.get_height() * 2))
-
     def _draw_buttons(self):
         for rect, label, action in self._buttons:
             if action == "restart":
-                self._pixel_button(rect, RED, (255, 128, 138),
-                                   (150, 28, 50))
+                self._draw_button(rect, RED, (200, 70, 75))
             else:
-                self._pixel_button(rect, PURPLE_BTN, (166, 144, 255),
-                                   (58, 40, 180))
+                self._draw_button(rect, PURPLE_BTN, (110, 88, 190))
                 if action == "sound":
                     label = ("音效:开" if self.sound.on else "音效:关")
             txt = self.f_btn.render(label, True, WHITE)
             self.screen.blit(txt, txt.get_rect(center=rect.center))
         tip = self.f_small.render("点选两颗相邻糖果交换，也可按住拖动交换",
-                                  True, (206, 192, 240))
+                                  True, (255, 255, 255))
         self.screen.blit(tip, tip.get_rect(center=(WIN_W / 2, WIN_H - 18)))
 
     def _draw_overlay(self):
         layer = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
-        layer.fill((45, 20, 75, 180))
+        layer.fill((120, 60, 80, 150))
         self.screen.blit(layer, (0, 0))
 
         panel = pygame.Rect(0, 0, 320, 300)
         panel.center = (WIN_W // 2, WIN_H // 2)
-        self._pixel_panel(panel, t=4)
-        # 外框四角像素装饰（亮紫 8x8 块）
-        for cx0, cy0 in ((panel.x - 4, panel.y - 4),
-                         (panel.x + panel.w + 4, panel.y - 4),
-                         (panel.x - 4, panel.y + panel.h + 4),
-                         (panel.x + panel.w + 4, panel.y + panel.h + 4)):
-            pygame.draw.rect(self.screen, BOARD_EDGE_LT,
-                             (cx0 - 4, cy0 - 4, 8, 8))
+        self._draw_panel(panel, radius=18)
 
         if self.state == STATE_MENU:
             title, lines, btn_label = "欢迎来玩消消乐", [
@@ -1432,8 +1389,7 @@ class Game:
             self.screen.blit(lt, lt.get_rect(center=(panel.centerx,
                                                      panel.y + 108 + i * 30)))
         self._overlay_btn.update(panel.centerx - 100, panel.bottom - 70, 200, 48)
-        self._pixel_button(self._overlay_btn, PURPLE_BTN,
-                           (166, 144, 255), (58, 40, 180))
+        self._draw_button(self._overlay_btn, PURPLE_BTN, (110, 88, 190))
         bt = self.f_btn.render(btn_label, True, WHITE)
         self.screen.blit(bt, bt.get_rect(center=self._overlay_btn.center))
 
