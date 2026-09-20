@@ -1238,15 +1238,29 @@ class Game:
             midright=(in_x + in_w - 10, in_y + in_h // 2)))
 
     def _draw_select_box(self, cell, phase, hint=False):
-        """选中/提示框：素材图片 + 呼吸缩放脉动。"""
+        """选中/提示框：发光底 + 素材图片 + 脉动亮色描边。"""
         r, c = cell
+        cx = BOARD_X + c * CELL + CELL // 2
+        cy = BOARD_Y + r * CELL + CELL // 2
+        color = HINT_COLOR if hint else SELECT_COLOR
+        pulse = 0.5 + 0.5 * math.sin(phase)          # 0..1 呼吸
+
+        # 发光底：半透明色圆角方块铺满格子
+        glow = pygame.Surface((CELL - 2, CELL - 2), pygame.SRCALPHA)
+        glow.fill(color + (int(70 + 60 * pulse),))
+        self.screen.blit(glow, glow.get_rect(center=(cx, cy)))
+
+        # 素材框（呼吸缩放）
         img = self.art.circle_choose if hint else self.art.choose
-        k = 1.0 + 0.06 * math.sin(phase)
-        size = int((CELL - 4) * k)
+        size = int((CELL - 4) * (1.0 + 0.08 * math.sin(phase)))
         img2 = pygame.transform.smoothscale(img, (size, size))
-        self.screen.blit(img2, img2.get_rect(
-            center=(BOARD_X + c * CELL + CELL // 2,
-                    BOARD_Y + r * CELL + CELL // 2)))
+        self.screen.blit(img2, img2.get_rect(center=(cx, cy)))
+
+        # 外层脉动描边（宽度 3~5px）
+        bw = 3 + int(2 * pulse)
+        rect = pygame.Rect(0, 0, CELL - 2, CELL - 2)
+        rect.center = (cx, cy)
+        pygame.draw.rect(self.screen, color, rect, bw, border_radius=10)
 
     def _draw_board(self, now_ms):
         # 棋盘：圆角奶白底板 + 柔和外圈
@@ -1271,7 +1285,7 @@ class Game:
             hint_cells = {(self.hint[0], self.hint[1]),
                           (self.hint[2], self.hint[3])}
 
-        # 元素（最近邻缩放，硬边像素感）
+        # 元素（平滑缩放；选中的糖果呼吸放大，更醒目）
         for r in range(ROWS):
             for c in range(COLS):
                 g = self.board.grid[r][c]
@@ -1279,6 +1293,8 @@ class Game:
                     continue
                 is_sel = self.selected == (r, c)
                 size = max(1, int(TILE * g.scale))
+                if is_sel:
+                    size = int(size * (1.10 + 0.08 * math.sin(now_ms / 110)))
                 highlighted = is_sel or ((r, c) in hint_cells)
                 img = self.art.scaled(g, size, highlighted)
                 img.set_alpha(int(255 * g.alpha))
