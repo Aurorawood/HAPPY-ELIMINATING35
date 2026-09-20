@@ -1230,9 +1230,12 @@ class Game:
             pygame.draw.rect(self.screen, PROGRESS_RED,
                              (in_x, in_y, fw, in_h),
                              border_radius=in_h // 2)
-        tgt = self.f_small.render("目标 %d" % self.target, True, WHITE)
+        # 目标文字：深色（浅色槽底上白字看不清），对齐到槽内右侧居中
+        cur = min(self.target, self.score - self.level_start_score)
+        tgt = self.f_small.render("%d / %d" % (cur, self.target),
+                                  True, TEXT_DARK)
         self.screen.blit(tgt, tgt.get_rect(
-            midright=(p_x + p_w - 20, p_y + p_h // 2)))
+            midright=(in_x + in_w - 10, in_y + in_h // 2)))
 
     def _draw_select_box(self, cell, phase, hint=False):
         """选中/提示框：素材图片 + 呼吸缩放脉动。"""
