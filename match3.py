@@ -22,6 +22,9 @@ import json
 import wave
 import struct
 import random
+import socket
+import queue
+import threading
 from io import BytesIO
 
 try:
@@ -73,6 +76,10 @@ HINT_COLOR = (90, 200, 255)      # 提示框：天青
 STATE_MENU = "menu"
 STATE_PLAY = "play"
 STATE_OVER = "over"
+STATE_LAN = "lan"            # 局域网对战连接界面
+
+LAN_PORT = 50007             # 局域网对战 TCP 端口
+PK_DURATION = 90             # 对战时长（秒）
 
 
 # ==================== 缓动函数 ====================
@@ -604,6 +611,113 @@ class ImageArt:
         return img
 
 
+# ==================== 局域网对战网络层 ====================
+class LanLink:
+    """
+    TCP 点对点连接，JSON 行协议（每行一个 JSON 对象）。
+    接收在后台线程完成并推入队列，主线程用 poll() 取用，不阻塞渲染。
+    对方断开或出错时，队列会收到 {"t": "_closed"}。
+    """
+
+    def __init__(self, sock):
+        self.sock = sock
+        self._q = queue.Queue()
+        self._send_lock = threading.Lock()
+        self._closed = False
+        sock.settimeout(None)
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+
+    @classmethod
+    def host(cls, port=LAN_PORT):
+        """监听端口，返回 (server_sock, 接受后的 LanLink 由 accept() 取得)。"""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.listen(1)
+        return srv
+
+    @classmethod
+    def accept(cls, srv):
+        """阻塞等待一个客户端连接，返回 LanLink。"""
+        conn, _addr = srv.accept()
+        srv.close()
+        return cls(conn)
+
+    @classmethod
+    def join(cls, ip, port=LAN_PORT, timeout=5.0):
+        """连接主机，失败抛异常。"""
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        return cls(sock)
+
+    def send(self, msg):
+        if self._closed:
+            return
+        try:
+            data = (json.dumps(msg) + "\n").encode("utf-8")
+            with self._send_lock:
+                self.sock.sendall(data)
+        except OSError:
+            self._closed = True
+            self._q.put({"t": "_closed"})
+
+    def _recv_loop(self):
+        buf = b""
+        try:
+            while True:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if line:
+                        try:
+                            self._q.put(json.loads(line.decode("utf-8")))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+        self._closed = True
+        self._q.put({"t": "_closed"})
+
+    def poll(self):
+        """取出所有待处理消息（无则返回空列表）。"""
+        msgs = []
+        while True:
+            try:
+                msgs.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return msgs
+
+    def close(self):
+        self._closed = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def get_lan_ip():
+    """获取本机局域网 IP（用于建房时展示给对方）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))      # 不会真的发包，只为选路由
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+
+
 # ==================== 主游戏类 ====================
 class Game:
     BEST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -636,6 +750,17 @@ class Game:
         self.state = STATE_MENU
         self.result = None
 
+        # 局域网对战
+        self.pk = None              # {"link","opp","end_ms","seed"} 或 None
+        self.pk_final = None        # 结算时定格的 (我方分, 对方分)
+        self._pk_sent = -1          # 已同步给对方的分数
+        self.lan_mode = None        # None / "host" / "join"
+        self.lan_ip = ""            # IP 输入框内容
+        self.lan_status = ""        # 状态/错误提示
+        self.lan_srv = None         # 建房监听 socket
+        self.lan_link = None        # 已建立、尚未开赛的连接
+        self._lan_q = queue.Queue() # accept/join 异步结果
+
         # 关卡数据
         self.level = 1
         self.score = 0
@@ -656,6 +781,8 @@ class Game:
         self.waves = []                 # (x, y, radius, life)
 
         self._overlay_btn = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 80, 200, 48)
+        self._overlay_btn2 = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 136,
+                                         200, 44)
         self._buttons = self._build_buttons()
         self._bg_surf = self._render_background()
         # 启动落入动画（菜单界面即可看到动物落位）
@@ -766,6 +893,158 @@ class Game:
         self.waves = []
         self.board = Board()
         self.state = STATE_PLAY
+        self._start_gen(self._flow_init())
+
+    # ---------- 局域网对战 ----------
+    def _lan_reset(self):
+        """清理 LAN 界面状态（未开赛的连接/监听）。"""
+        if self.lan_link is not None:
+            self.lan_link.close()
+            self.lan_link = None
+        if self.lan_srv is not None:
+            try:
+                self.lan_srv.close()
+            except OSError:
+                pass
+            self.lan_srv = None
+        self.lan_mode = None
+        self.lan_status = ""
+
+    def _pk_cleanup(self, notify=True):
+        """结束对战连接。"""
+        if self.pk is not None:
+            if notify:
+                self.pk["link"].send({"t": "bye"})
+            self.pk["link"].close()
+            self.pk = None
+
+    def _start_host(self):
+        """建房：监听端口并后台等待对方加入。"""
+        self.lan_srv = LanLink.host()
+        self.lan_mode = "host"
+        self.lan_status = "等待对方加入…"
+        threading.Thread(target=self._accept_worker,
+                         args=(self.lan_srv,), daemon=True).start()
+
+    def _accept_worker(self, srv):
+        try:
+            link = LanLink.accept(srv)
+            self._lan_q.put(("ok", link, srv))
+        except OSError:
+            self._lan_q.put(("err", "建房失败或监听已关闭", srv))
+
+    def _join_worker(self, ip):
+        try:
+            link = LanLink.join(ip)
+            self._lan_q.put(("ok", link, None))
+        except OSError:
+            self._lan_q.put(("err", "连接失败，请检查 IP 或确认对方已建房", None))
+
+    def start_pk(self, seed, link):
+        """双方用同一种子建相同棋盘，90 秒限时比分。"""
+        random.seed(seed)
+        self.score = 0
+        self.level_start_score = 0
+        self.selected = None
+        self.drag = None
+        self.hint = None
+        self.particles = []
+        self.floats = []
+        self.beams = []
+        self.waves = []
+        self.board = Board()
+        self.pk = {"link": link, "opp": 0, "seed": seed,
+                   "end_ms": pygame.time.get_ticks() + PK_DURATION * 1000}
+        self._pk_sent = -1
+        self.pk_final = None
+        self.lan_link = None
+        self.lan_srv = None
+        self.state = STATE_PLAY
+        self._start_gen(self._flow_init())
+
+    def _pk_settle(self, result=None):
+        """时间到或对方离开时结算。"""
+        if self.pk is None:
+            return
+        my, opp = self.score, self.pk["opp"]
+        if result is None:
+            result = ("pk_win" if my > opp
+                      else "pk_lose" if my < opp else "pk_draw")
+        self.pk_final = (my, opp)
+        self.result = result
+        # 正常结算发送 end（带最终分数），bye 只用于中途主动退出
+        link = self.pk["link"]
+        self.pk = None
+        link.send({"t": "end", "score": my})
+        link.close()
+        self.state = STATE_OVER
+        if result == "pk_win":
+            self.sound.win()
+        else:
+            self.sound.lose()
+
+    def _poll_pk(self):
+        """主循环每帧调用：处理对战消息、同步分数、检查时间。"""
+        if self.pk is None:
+            return
+        for m in self.pk["link"].poll():
+            t = m.get("t")
+            if t == "score":
+                self.pk["opp"] = int(m.get("score", 0))
+            elif t == "end":
+                self.pk["opp"] = int(m.get("score", 0))
+                self._pk_settle()               # 对方已到点，按其终分结算
+                return
+            elif t in ("bye", "_closed"):
+                self._pk_settle("pk_win")       # 对方中途离开/掉线判胜
+                return
+        if self.score != self._pk_sent:
+            self.pk["link"].send({"t": "score", "score": self.score})
+            self._pk_sent = self.score
+        if pygame.time.get_ticks() >= self.pk["end_ms"]:
+            self._pk_settle()
+
+    def _poll_lan(self):
+        """LAN 界面每帧调用：处理连接结果与开赛消息。"""
+        while True:
+            try:
+                tag, payload, srv = self._lan_q.get_nowait()
+            except queue.Empty:
+                break
+            if srv is not None and srv is not self.lan_srv:
+                continue                # 旧监听线程的迟到结果，丢弃
+            if tag == "ok":
+                self.lan_link = payload
+                self.lan_status = ("对方已加入，可以开始！"
+                                   if self.lan_mode == "host"
+                                   else "已连接，等待主机开始…")
+            else:
+                self.lan_status = payload
+        if self.lan_link is None:
+            return
+        for m in self.lan_link.poll():
+            t = m.get("t")
+            if t == "start" and self.lan_mode == "join":
+                self.start_pk(int(m.get("seed", 0)), self.lan_link)
+                return
+            if t in ("bye", "_closed"):
+                self.lan_link.close()
+                self.lan_link = None
+                if self.lan_mode == "host":
+                    self._start_host()          # 对方离开，重新等待
+                    self.lan_status = "对方已离开，等待新玩家…"
+                else:
+                    self.lan_status = "与主机的连接已断开"
+                return
+
+    def _go_menu(self):
+        """结束对战/连接，回到主菜单。"""
+        self._pk_cleanup()
+        self._lan_reset()
+        self.result = None
+        self.pk_final = None
+        self.board = Board()
+        self.state = STATE_MENU
         self._start_gen(self._flow_init())
 
     # ---------- 生成器驱动 ----------
@@ -1004,13 +1283,14 @@ class Game:
             swap_keys = set()
 
         # 无更多匹配 → 回合结束判定
-        earned = self.score - self.level_start_score
-        if earned >= self.target:
-            self._game_over(True)
-            return
-        if self.moves <= 0:
-            self._game_over(False)
-            return
+        if self.pk is None:                 # PK 模式无目标/步数限制，计时统一结算
+            earned = self.score - self.level_start_score
+            if earned >= self.target:
+                self._game_over(True)
+                return
+            if self.moves <= 0:
+                self._game_over(False)
+                return
         if not self.board.has_valid_move():
             self.floats.append(FloatText(WIN_W / 2, BOARD_Y + ROWS * CELL / 2,
                                          "无解，自动洗牌！", (255, 255, 255), 22))
@@ -1110,20 +1390,51 @@ class Game:
 
     def handle_event(self, event):
         if event.type == pygame.QUIT:
+            self._pk_cleanup()
+            self._lan_reset()
             return False
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            if self.pk is not None or self.state == STATE_LAN:
+                self._go_menu()
+                return True
+            self._pk_cleanup()
+            self._lan_reset()
             return False
 
+        # LAN 界面：IP 键盘输入
+        if (self.state == STATE_LAN and self.lan_mode == "join"
+                and self.lan_link is None
+                and event.type == pygame.KEYDOWN):
+            if event.key == pygame.K_BACKSPACE:
+                self.lan_ip = self.lan_ip[:-1]
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._lan_connect()
+            elif event.unicode and event.unicode in "0123456789." \
+                    and len(self.lan_ip) < 15:
+                self.lan_ip += event.unicode
+            return True
+
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # LAN 界面按钮
+            if self.state == STATE_LAN:
+                self._lan_click(event.pos)
+                return True
             # 菜单 / 结束面板的按钮
             if self.state in (STATE_MENU, STATE_OVER):
                 if self._overlay_btn.collidepoint(event.pos):
                     if self.state == STATE_MENU:
                         self.start_level()
+                    elif self.result in ("pk_win", "pk_lose", "pk_draw"):
+                        self._go_menu()
                     elif self.result == "win":
                         self.start_level(inc=True)
                     else:
                         self.start_level(retry=True)
+                elif (self.state == STATE_MENU
+                        and self._overlay_btn2.collidepoint(event.pos)):
+                    self._lan_reset()
+                    self.lan_ip = ""
+                    self.state = STATE_LAN
                 return True
             # 底部按钮
             for rect, _label, action in self._buttons:
@@ -1141,6 +1452,8 @@ class Game:
         if self._busy():
             return
         if action == "restart":
+            if self.pk is not None:
+                return                  # 对战中不可重开
             self.start_level(retry=True)
         elif action == "hint":
             h = self.board.find_hint()
@@ -1152,6 +1465,54 @@ class Game:
             self._save_sound_pref()
             if self.sound.on:
                 self.sound.swap_s()
+
+    # ---------- LAN 界面 ----------
+    def _lan_layout(self):
+        panel = pygame.Rect(0, 0, 360, 330)
+        panel.center = (WIN_W // 2, WIN_H // 2)
+        return {
+            "panel": panel,
+            "host": pygame.Rect(panel.centerx - 100, panel.y + 120, 200, 44),
+            "join": pygame.Rect(panel.centerx - 100, panel.y + 174, 200, 44),
+            "back": pygame.Rect(panel.centerx - 70, panel.bottom - 54, 140, 38),
+            "go": pygame.Rect(panel.centerx - 100, panel.bottom - 106, 200, 44),
+            "input": pygame.Rect(panel.x + 40, panel.y + 116, panel.w - 80, 42),
+            "connect": pygame.Rect(panel.centerx - 100, panel.y + 168, 200, 44),
+        }
+
+    def _lan_connect(self):
+        ip = self.lan_ip.strip()
+        if not ip:
+            self.lan_status = "请输入主机 IP"
+            return
+        self.lan_status = "正在连接 %s …" % ip
+        threading.Thread(target=self._join_worker, args=(ip,),
+                         daemon=True).start()
+
+    def _lan_click(self, pos):
+        L = self._lan_layout()
+        if self.lan_mode is None:
+            if L["host"].collidepoint(pos):
+                try:
+                    self._start_host()
+                except OSError:
+                    self.lan_status = "建房失败：端口可能被占用"
+            elif L["join"].collidepoint(pos):
+                self.lan_mode = "join"
+                self.lan_status = "输入主机 IP 后点击连接"
+        elif self.lan_mode == "host":
+            if self.lan_link is not None and L["go"].collidepoint(pos):
+                seed = random.randrange(1, 2 ** 31)
+                self.lan_link.send({"t": "start", "seed": seed,
+                                    "duration": PK_DURATION})
+                self.start_pk(seed, self.lan_link)
+                return
+        elif self.lan_mode == "join":
+            if self.lan_link is None and L["connect"].collidepoint(pos):
+                self._lan_connect()
+                return
+        if L["back"].collidepoint(pos):
+            self._go_menu()
 
     def handle_mouse(self):
         """处理拖动与点击（每帧调用）。"""
@@ -1206,6 +1567,15 @@ class Game:
         labels = ("关卡", "分数", "最佳", "步数")
         values = (str(self.level), str(self.score), str(self.best), str(self.moves))
         val_colors = (TEXT_DARK, TEXT_DARK, TEXT_DARK, RED)
+        if self.pk is not None:
+            remain = max(0, (self.pk["end_ms"] - pygame.time.get_ticks()) // 1000)
+            labels = ("对战", "我方", "对方", "时间")
+            values = ("LAN", str(self.score), str(self.pk["opp"]),
+                      str(remain))
+            # 最后 10 秒红色闪烁
+            flash = remain <= 10 and (pygame.time.get_ticks() // 300) % 2 == 0
+            val_colors = (TEXT_DARK, TEXT_DARK, (50, 130, 200),
+                          (255, 40, 60) if flash else RED)
         bw = (WIN_W - 24 - 24) / 4
         x = 12
         for i in range(4):
@@ -1217,25 +1587,44 @@ class Game:
             self.screen.blit(vl, vl.get_rect(center=(rect.centerx, 80)))
             x += bw + 8
 
-        # 进度条（木质框素材 + 圆角内部填充）
+        # 进度条（木质框素材 + 圆角内部填充；PK 模式为双人对战条）
         p_x, p_y, p_w, p_h = 12, 100, WIN_W - 24, 54
         self.screen.blit(self.art.proc_frame, (p_x, p_y))
         in_x, in_y = p_x + 13, p_y + 14
         in_w, in_h = p_w - 26, 26
-        pygame.draw.rect(self.screen, PROGRESS_BG,
-                         (in_x, in_y, in_w, in_h), border_radius=in_h // 2)
-        pct = max(0, min(1, (self.score - self.level_start_score) / self.target))
-        if pct > 0:
-            fw = max(in_h, int(in_w * pct))
-            pygame.draw.rect(self.screen, PROGRESS_RED,
-                             (in_x, in_y, fw, in_h),
-                             border_radius=in_h // 2)
-        # 目标文字：深色（浅色槽底上白字看不清），对齐到槽内右侧居中
-        cur = min(self.target, self.score - self.level_start_score)
-        tgt = self.f_small.render("%d / %d" % (cur, self.target),
-                                  True, TEXT_DARK)
-        self.screen.blit(tgt, tgt.get_rect(
-            midright=(in_x + in_w - 10, in_y + in_h // 2)))
+        if self.pk is not None:
+            my, opp = self.score, self.pk["opp"]
+            top = max(my, opp, 1)
+            half = (in_h - 4) // 2
+            pygame.draw.rect(self.screen, PROGRESS_BG,
+                             (in_x, in_y, in_w, in_h), border_radius=8)
+            w1 = max(half, int(in_w * my / top)) if my else 0
+            w2 = max(half, int(in_w * opp / top)) if opp else 0
+            if w1:
+                pygame.draw.rect(self.screen, PROGRESS_RED,
+                                 (in_x, in_y, w1, half), border_radius=6)
+            if w2:
+                pygame.draw.rect(self.screen, (80, 170, 255),
+                                 (in_x, in_y + half + 4, w2, half),
+                                 border_radius=6)
+            vs = self.f_small.render("%d : %d" % (my, opp), True, TEXT_DARK)
+            self.screen.blit(vs, vs.get_rect(
+                midright=(in_x + in_w - 10, in_y + in_h // 2)))
+        else:
+            pygame.draw.rect(self.screen, PROGRESS_BG,
+                             (in_x, in_y, in_w, in_h), border_radius=in_h // 2)
+            pct = max(0, min(1, (self.score - self.level_start_score) / self.target))
+            if pct > 0:
+                fw = max(in_h, int(in_w * pct))
+                pygame.draw.rect(self.screen, PROGRESS_RED,
+                                 (in_x, in_y, fw, in_h),
+                                 border_radius=in_h // 2)
+            # 目标文字：深色（浅色槽底上白字看不清），对齐到槽内右侧居中
+            cur = min(self.target, self.score - self.level_start_score)
+            tgt = self.f_small.render("%d / %d" % (cur, self.target),
+                                      True, TEXT_DARK)
+            self.screen.blit(tgt, tgt.get_rect(
+                midright=(in_x + in_w - 10, in_y + in_h // 2)))
 
     def _draw_select_box(self, cell, phase, hint=False):
         """选中/提示框：发光底 + 素材图片 + 脉动亮色描边。"""
@@ -1380,16 +1769,25 @@ class Game:
         layer.fill((120, 60, 80, 150))
         self.screen.blit(layer, (0, 0))
 
-        panel = pygame.Rect(0, 0, 320, 300)
+        is_menu = self.state == STATE_MENU
+        panel = pygame.Rect(0, 0, 320, 340 if is_menu else 300)
         panel.center = (WIN_W // 2, WIN_H // 2)
         self._draw_panel(panel, radius=18)
 
-        if self.state == STATE_MENU:
+        btn2_label = None
+        if is_menu:
             title, lines, btn_label = "欢迎来玩消消乐", [
                 "交换相邻糖果，凑成三个或更多",
                 "同色即可消除",
                 "四连出条纹糖，五连出彩虹糖",
                 "拐角出炸弹糖！"], "开始游戏"
+            btn2_label = "局域网对战"
+        elif self.result in ("pk_win", "pk_lose", "pk_draw"):
+            title = {"pk_win": "你赢了！", "pk_lose": "惜败…",
+                     "pk_draw": "平局！"}[self.result]
+            my, opp = self.pk_final or (self.score, 0)
+            lines = ["我方 %d 分" % my, "对方 %d 分" % opp]
+            btn_label = "返回菜单"
         else:
             earned = self.score - self.level_start_score
             if self.result == "win":
@@ -1407,18 +1805,86 @@ class Game:
             lt = self.f_panel_text.render(line, True, TEXT_SOFT)
             self.screen.blit(lt, lt.get_rect(center=(panel.centerx,
                                                      panel.y + 108 + i * 30)))
-        self._overlay_btn.update(panel.centerx - 100, panel.bottom - 70, 200, 48)
+        btn_y = panel.bottom - (116 if btn2_label else 70)
+        self._overlay_btn.update(panel.centerx - 100, btn_y, 200, 48)
         self._draw_button(self._overlay_btn, PURPLE_BTN, (110, 88, 190))
         bt = self.f_btn.render(btn_label, True, WHITE)
         self.screen.blit(bt, bt.get_rect(center=self._overlay_btn.center))
+        if btn2_label:
+            self._overlay_btn2.update(panel.centerx - 100, panel.bottom - 60,
+                                      200, 44)
+            self._draw_button(self._overlay_btn2, RED, (200, 70, 75))
+            bt2 = self.f_btn.render(btn2_label, True, WHITE)
+            self.screen.blit(bt2, bt2.get_rect(center=self._overlay_btn2.center))
+
+    def _draw_lan(self, now_ms):
+        """LAN 连接界面：建房 / 加入 / 等待 / IP 输入。"""
+        layer = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        layer.fill((120, 60, 80, 150))
+        self.screen.blit(layer, (0, 0))
+        L = self._lan_layout()
+        panel = L["panel"]
+        self._draw_panel(panel, radius=18)
+
+        tt = self.f_panel_title.render("局域网对战", True, TEXT_DARK)
+        self.screen.blit(tt, tt.get_rect(center=(panel.centerx, panel.y + 42)))
+        sub = self.f_small.render(
+            "双方同棋盘，%d 秒内得分高者胜" % PK_DURATION, True, TEXT_SOFT)
+        self.screen.blit(sub, sub.get_rect(center=(panel.centerx, panel.y + 74)))
+
+        if self.lan_mode is None:
+            for key, label in (("host", "创建房间"), ("join", "加入房间")):
+                self._draw_button(L[key], PURPLE_BTN, (110, 88, 190))
+                bt = self.f_btn.render(label, True, WHITE)
+                self.screen.blit(bt, bt.get_rect(center=L[key].center))
+        elif self.lan_mode == "host":
+            ip = self.f_panel_text.render("本机 IP：%s（告诉对方）"
+                                          % get_lan_ip(), True, TEXT_DARK)
+            self.screen.blit(ip, ip.get_rect(center=(panel.centerx,
+                                                     panel.y + 120)))
+            if self.lan_link is not None:
+                self._draw_button(L["go"], RED, (200, 70, 75))
+                bt = self.f_btn.render("开始对战", True, WHITE)
+                self.screen.blit(bt, bt.get_rect(center=L["go"].center))
+        else:  # join
+            box = L["input"]
+            pygame.draw.rect(self.screen, (250, 244, 246), box,
+                             border_radius=8)
+            pygame.draw.rect(self.screen, TEXT_SOFT, box, 2, border_radius=8)
+            text = self.lan_ip
+            if self.lan_link is None and (now_ms // 500) % 2 == 0:
+                text += "|"
+            it = self.f_panel_text.render(text, True, TEXT_DARK)
+            self.screen.blit(it, it.get_rect(midleft=(box.x + 12,
+                                                      box.centery)))
+            if self.lan_link is None:
+                self._draw_button(L["connect"], PURPLE_BTN, (110, 88, 190))
+                bt = self.f_btn.render("连接", True, WHITE)
+                self.screen.blit(bt, bt.get_rect(center=L["connect"].center))
+
+        # 状态提示（错误用红色）
+        if self.lan_status:
+            err = any(k in self.lan_status for k in ("失败", "断开", "离开"))
+            st = self.f_panel_text.render(self.lan_status, True,
+                                          RED if err else TEXT_SOFT)
+            self.screen.blit(st, st.get_rect(center=(panel.centerx,
+                                                     panel.bottom - 132)))
+
+        self._draw_button(L["back"], (200, 180, 190), (170, 145, 155))
+        bt = self.f_small.render("返回菜单", True, WHITE)
+        self.screen.blit(bt, bt.get_rect(center=L["back"].center))
 
     def draw(self, now_ms):
         self._draw_background()
-        self._draw_hud()
-        self._draw_board(now_ms)
-        self._draw_buttons()
-        if self.state in (STATE_MENU, STATE_OVER):
-            self._draw_overlay()
+        if self.state == STATE_LAN:
+            self._draw_board(now_ms)
+            self._draw_lan(now_ms)
+        else:
+            self._draw_hud()
+            self._draw_board(now_ms)
+            self._draw_buttons()
+            if self.state in (STATE_MENU, STATE_OVER):
+                self._draw_overlay()
         pygame.display.flip()
 
     # ==================== 主循环 ====================
@@ -1430,6 +1896,9 @@ class Game:
                     pygame.quit()
                     return
             self.handle_mouse()
+            if self.state == STATE_LAN:
+                self._poll_lan()
+            self._poll_pk()
             self._update_gen(dt)
             self._update_effects(dt)
             self.draw(pygame.time.get_ticks())
