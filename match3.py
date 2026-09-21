@@ -81,6 +81,24 @@ STATE_LAN = "lan"            # 局域网对战连接界面
 LAN_PORT = 50007             # 局域网对战 TCP 端口
 PK_DURATION = 90             # 对战时长（秒）
 
+# ---- 干扰道具 ----
+MAX_ITEM_USES = 5            # 每人每局道具使用上限
+ENERGY_MAX = 1000            # 能量槽上限（满一格可使用一个道具）
+ENERGY_PER_GEM = 45          # 每消除一个糖果获得的能量
+ENERGY_SPECIAL = 120         # 消除特效糖额外能量
+FOG_MS = 3000                # 迷雾持续
+PAPER_MS = 3000              # 糖纸持续
+IMP_MS = 2500                # 小鬼预警时长（随后炸乱 3x3）
+
+# (key, 名称, 主题色)，道具槽顺序
+ITEM_DEFS = [("fog", "迷雾", (190, 195, 215)),
+             ("jelly", "果冻", (255, 150, 90)),
+             ("imp", "小鬼", (170, 90, 220)),
+             ("paper", "糖纸", (255, 190, 215)),
+             ("shield", "护盾", (90, 180, 255))]
+ITEM_KEYS = [d[0] for d in ITEM_DEFS]
+ITEM_NAMES = {k: n for k, n, _ in ITEM_DEFS}
+
 
 # ==================== 缓动函数 ====================
 def ease_linear(t):
@@ -718,6 +736,41 @@ def get_lan_ip():
             return "127.0.0.1"
 
 
+# ==================== 稳健中文字体加载 ====================
+_FONT_CACHE = {}
+
+def _font_candidates(bold):
+    win_fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    if bold:
+        names = ("msyhbd.ttc", "simhei.ttf", "msyh.ttc", "simsun.ttc")
+    else:
+        names = ("msyh.ttc", "simhei.ttf", "simsun.ttc")
+    return [os.path.join(win_fonts, n) for n in names]
+
+def load_font(size, bold=False):
+    """
+    直接按路径加载系统字体文件，绕过 pygame.font.SysFont 的注册表枚举。
+    部分电脑字体注册表含非字符串（int）条目，SysFont 会抛
+    'TypeError: expected str, bytes or os.PathLike object, not int'。
+    """
+    ck = (size, bold)
+    f = _FONT_CACHE.get(ck)
+    if f is not None:
+        return f
+    for path in _font_candidates(bold):
+        if os.path.isfile(path):
+            try:
+                f = pygame.font.Font(path, size)
+                _FONT_CACHE[ck] = f
+                return f
+            except Exception:
+                continue
+    # 兜底：pygame 内置字体（不支持中文但不会崩溃）
+    f = pygame.font.Font(None, int(size * 1.4))
+    _FONT_CACHE[ck] = f
+    return f
+
+
 # ==================== 主游戏类 ====================
 class Game:
     BEST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -729,11 +782,8 @@ class Game:
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
         self.clock = pygame.time.Clock()
 
-        # 中文字体（Windows 自带微软雅黑）
-        def font(size, bold=False):
-            f = pygame.font.SysFont("microsoftyahei,simhei", size)
-            f.set_bold(bold)
-            return f
+        # 中文字体（直接从系统字体文件加载，避免 SysFont 注册表枚举崩溃）
+        font = load_font
         self.f_title = font(24, True)
         self.f_stat_label = font(12)
         self.f_stat_val = font(20, True)
@@ -753,6 +803,8 @@ class Game:
         # 局域网对战
         self.pk = None              # {"link","opp","end_ms","seed"} 或 None
         self.pk_final = None        # 结算时定格的 (我方分, 对方分)
+        self.after_pk = None        # 结算后保留的连接（支持再来一局）
+        self.my_rematch = False     # 本方是否已请求再来一局
         self._pk_sent = -1          # 已同步给对方的分数
         self.lan_mode = None        # None / "host" / "join"
         self.lan_ip = ""            # IP 输入框内容
@@ -760,6 +812,17 @@ class Game:
         self.lan_srv = None         # 建房监听 socket
         self.lan_link = None        # 已建立、尚未开赛的连接
         self._lan_q = queue.Queue() # accept/join 异步结果
+
+        # 道具与受影响效果
+        self.energy = 0             # 0..ENERGY_MAX
+        self.items_used = 0         # 已用道具数
+        self.shield_held = False    # 是否装备护盾
+        self.fog_end = 0            # 迷雾结束时刻
+        self.paper = None           # (结束时刻, 中心r, 中心c)
+        self.imp = None             # (爆炸时刻, r, c)
+        self.shuffle_q = []         # 等待空闲执行的位移动画：[(cells,)]
+        self._idle_tw = []          # 空闲期 tween（道具位移）
+        self.banner = None          # (文字, 结束时刻, 颜色)
 
         # 关卡数据
         self.level = 1
@@ -940,7 +1003,7 @@ class Game:
         except OSError:
             self._lan_q.put(("err", "连接失败，请检查 IP 或确认对方已建房", None))
 
-    def start_pk(self, seed, link):
+    def start_pk(self, seed, link, is_host=False):
         """双方用同一种子建相同棋盘，90 秒限时比分。"""
         random.seed(seed)
         self.score = 0
@@ -954,29 +1017,54 @@ class Game:
         self.waves = []
         self.board = Board()
         self.pk = {"link": link, "opp": 0, "seed": seed,
+                   "is_host": is_host, "opp_flash": -10 ** 9,
                    "end_ms": pygame.time.get_ticks() + PK_DURATION * 1000}
         self._pk_sent = -1
         self.pk_final = None
+        self.after_pk = None
+        self.my_rematch = False
+        # 道具状态重置
+        self.energy = 0
+        self.items_used = 0
+        self.shield_held = False
+        self.fog_end = 0
+        self.paper = None
+        self.imp = None
+        self.shuffle_q = []
+        self._idle_tw = []
+        self.banner = None
         self.lan_link = None
         self.lan_srv = None
         self.state = STATE_PLAY
         self._start_gen(self._flow_init())
 
-    def _pk_settle(self, result=None):
-        """时间到或对方离开时结算。"""
+    def _pk_settle(self, result=None, keep_link=False):
+        """
+        时间到或对方离开时结算。
+        keep_link=True：正常打满时间，保留连接以支持"再来一局"；
+        keep_link=False：对方掉线/中途离开，只能返回菜单。
+        """
         if self.pk is None:
             return
         my, opp = self.score, self.pk["opp"]
+        is_host = self.pk.get("is_host", False)
         if result is None:
             result = ("pk_win" if my > opp
                       else "pk_lose" if my < opp else "pk_draw")
         self.pk_final = (my, opp)
         self.result = result
-        # 正常结算发送 end（带最终分数），bye 只用于中途主动退出
         link = self.pk["link"]
         self.pk = None
-        link.send({"t": "end", "score": my})
-        link.close()
+        if keep_link:
+            # 正常结算：发 end（带最终分数），连接保留到 after_pk
+            link.send({"t": "end", "score": my})
+            self.after_pk = {"link": link, "is_host": is_host,
+                             "opp_rematch": False}
+            self.my_rematch = False
+        else:
+            # 对方已离开：直接关闭
+            link.close()
+            self.after_pk = None
         self.state = STATE_OVER
         if result == "pk_win":
             self.sound.win()
@@ -990,10 +1078,26 @@ class Game:
         for m in self.pk["link"].poll():
             t = m.get("t")
             if t == "score":
-                self.pk["opp"] = int(m.get("score", 0))
+                new_s = int(m.get("score", 0))
+                if new_s > self.pk["opp"]:           # 对方加分：飘字 + 高亮
+                    now = pygame.time.get_ticks()
+                    self.pk["opp_flash"] = now
+                    self.floats.append(FloatText(
+                        WIN_W * 0.75, 92,
+                        "+%d" % (new_s - self.pk["opp"]),
+                        (60, 150, 255), 18))
+                self.pk["opp"] = new_s
+            elif t == "item":
+                self._receive_item(m.get("item"))
+                if self.pk is None:                # 极端情况：结算中
+                    return
             elif t == "end":
-                self.pk["opp"] = int(m.get("score", 0))
-                self._pk_settle()               # 对方已到点，按其终分结算
+                new_s = int(m.get("score", 0))
+                if new_s > self.pk["opp"]:
+                    self.pk["opp_flash"] = pygame.time.get_ticks()
+                self.pk["opp"] = new_s
+                # 对方已到点，正常结算并保留连接
+                self._pk_settle(keep_link=True)
                 return
             elif t in ("bye", "_closed"):
                 self._pk_settle("pk_win")       # 对方中途离开/掉线判胜
@@ -1002,7 +1106,7 @@ class Game:
             self.pk["link"].send({"t": "score", "score": self.score})
             self._pk_sent = self.score
         if pygame.time.get_ticks() >= self.pk["end_ms"]:
-            self._pk_settle()
+            self._pk_settle(keep_link=True)    # 自己时间到，保留连接
 
     def _poll_lan(self):
         """LAN 界面每帧调用：处理连接结果与开赛消息。"""
@@ -1037,8 +1141,158 @@ class Game:
                     self.lan_status = "与主机的连接已断开"
                 return
 
+    # ---------- 干扰道具 ----------
+    def _gain_energy(self, gems, specials):
+        if self.pk is None or self.energy >= ENERGY_MAX:
+            return
+        self.energy = min(ENERGY_MAX,
+                          self.energy + gems * ENERGY_PER_GEM
+                          + specials * ENERGY_SPECIAL)
+
+    def _set_banner(self, text, color=(255, 255, 255)):
+        self.banner = (text, pygame.time.get_ticks() + 1800, color)
+
+    def _item_ready(self, key):
+        if self.energy < ENERGY_MAX or self.items_used >= MAX_ITEM_USES:
+            return False
+        if key == "shield" and self.shield_held:
+            return False
+        return True
+
+    def _use_item(self, key):
+        if not self._item_ready(key):
+            return
+        self.energy = 0
+        self.items_used += 1
+        if key == "shield":
+            self.shield_held = True
+            self._set_banner("护盾已装备", (120, 200, 255))
+            return
+        self.pk["link"].send({"t": "item", "item": key})
+        self._apply_item(key)
+        self._set_banner("你使用了 %s" % ITEM_NAMES[key])
+
+    def _receive_item(self, key):
+        name = ITEM_NAMES.get(key)
+        if name is None:
+            return
+        if self.shield_held:
+            self.shield_held = False
+            self._set_banner("护盾抵消了 %s！" % name, (120, 220, 255))
+            return
+        self._apply_item(key)
+        self._set_banner("对方使用了 %s！" % name, (255, 120, 120))
+
+    def _apply_item(self, key):
+        now = pygame.time.get_ticks()
+        if key == "fog":
+            self.fog_end = now + FOG_MS
+        elif key == "paper":
+            rr = random.randrange(2, ROWS - 2)
+            cc = random.randrange(2, COLS - 2)
+            self.paper = (now + PAPER_MS, rr, cc)
+        elif key == "imp":
+            cells = [(r, c) for r in range(ROWS) for c in range(COLS)
+                     if self.board.grid[r][c]]
+            rr, cc = random.choice(cells)
+            self.imp = (now + IMP_MS, rr, cc)
+        elif key == "jelly":
+            r = random.randrange(ROWS)
+            cells = [(r, c) for c in range(COLS)
+                     if self.board.grid[r][c]]
+            if len(cells) >= 2:
+                self.shuffle_q.append(cells)
+
+    def _do_shuffle(self, cells):
+        """把指定格内的糖果位置随机互换（不消除、不改分），播放位移动画。"""
+        gems = [self.board.grid[r][c] for r, c in cells]
+        order = list(range(len(gems)))
+        random.shuffle(order)
+        if len(order) > 1 and order == list(range(len(order))):
+            order[0], order[1] = order[1], order[0]
+        moves = list(zip(gems, [cells[i] for i in order]))
+        for gem, (nr, nc) in moves:               # 双射重排，直接覆盖
+            self.board.grid[nr][nc] = gem
+            gem.r, gem.c = nr, nc
+        for gem, (nr, nc) in moves:
+            tx, ty = cell_cx(nc), cell_cy(nr)
+            ox, oy = gem.x, gem.y
+            self._idle_tw.append(Tween(
+                0.3,
+                lambda e, gem=gem, ox=ox, oy=oy, tx=tx, ty=ty: (
+                    setattr(gem, "x", ox + (tx - ox) * e),
+                    setattr(gem, "y", oy + (ty - oy) * e)),
+                ease_in_out))
+
+    def _process_item_timing(self):
+        """PLAY 中每帧：执行排队位移、小鬼到时爆炸。"""
+        if self.gen is None and not self._idle_tw:
+            while self.shuffle_q:
+                self._do_shuffle(self.shuffle_q.pop(0))
+        now = pygame.time.get_ticks()
+        if self.imp and now >= self.imp[0]:
+            _t, rr, cc = self.imp
+            self.imp = None
+            cells = [(r, c)
+                     for r in range(rr - 1, rr + 2)
+                     for c in range(cc - 1, cc + 2)
+                     if in_bounds(r, c) and self.board.grid[r][c]]
+            if len(cells) >= 2:
+                if self.gen is None and not self._idle_tw:
+                    self._do_shuffle(cells)
+                else:
+                    self.shuffle_q.append(cells)
+
+    def _update_idle_tw(self, dt):
+        self._idle_tw = [t for t in self._idle_tw if not t.update(dt)]
+
+    # ---------- 结算后的再来一局 ----------
+    def _request_rematch(self):
+        """请求再来一局：发送 rematch 并标记本方意愿。"""
+        if self.after_pk is None or self.my_rematch:
+            return
+        self.my_rematch = True
+        self.after_pk["link"].send({"t": "rematch"})
+
+    def _poll_rematch(self):
+        """结算页每帧调用：处理 rematch/start/bye，双方同意后由主机开新局。"""
+        if self.after_pk is None:
+            return
+        link = self.after_pk["link"]
+        for m in link.poll():
+            t = m.get("t")
+            if t == "rematch":
+                self.after_pk["opp_rematch"] = True
+            elif t == "start":
+                # 主机在双方同意后发来新种子 → 直接开新局
+                seed = int(m.get("seed", 0))
+                self.after_pk = None
+                self.start_pk(seed, link)                  # 客户端 is_host=False
+                return
+            elif t in ("bye", "_closed"):
+                # 对方选择结束：关闭连接，结算页只剩"返回菜单"
+                link.close()
+                self.after_pk = None
+                return
+        # 主机：双方都请求再来一局 → 新种子、发 start、自己开赛
+        if (self.after_pk is not None
+                and self.after_pk["is_host"]
+                and self.my_rematch
+                and self.after_pk["opp_rematch"]):
+            seed = random.randrange(1, 2 ** 31)
+            link.send({"t": "start", "seed": seed,
+                       "duration": PK_DURATION})
+            self.after_pk = None
+            self.start_pk(seed, link, is_host=True)
+
     def _go_menu(self):
         """结束对战/连接，回到主菜单。"""
+        # 结算后保留的连接：通知对方本方结束
+        if self.after_pk is not None:
+            link = self.after_pk["link"]
+            self.after_pk = None
+            link.send({"t": "bye"})
+            link.close()
         self._pk_cleanup()
         self._lan_reset()
         self.result = None
@@ -1067,7 +1321,8 @@ class Game:
                 self.gen = None
 
     def _busy(self):
-        return self.state != STATE_PLAY or self.gen is not None
+        return (self.state != STATE_PLAY or self.gen is not None
+                or bool(self._idle_tw))
 
     # ---------- 初始落入动画 ----------
     def _flow_init(self):
@@ -1255,6 +1510,7 @@ class Game:
                                 ease_in_out))
             gained = len(full_set) * 20 * combo + special_n * 40 * combo
             self.score += gained
+            self._gain_energy(len(full_set), special_n)
             self.sound.clear_s(combo)
             if full_set:
                 mx = sum(centers_x) / len(centers_x)
@@ -1390,11 +1646,17 @@ class Game:
 
     def handle_event(self, event):
         if event.type == pygame.QUIT:
+            if self.after_pk is not None:
+                self.after_pk["link"].close()
+                self.after_pk = None
             self._pk_cleanup()
             self._lan_reset()
             return False
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             if self.pk is not None or self.state == STATE_LAN:
+                self._go_menu()
+                return True
+            if self.after_pk is not None:
                 self._go_menu()
                 return True
             self._pk_cleanup()
@@ -1425,17 +1687,29 @@ class Game:
                     if self.state == STATE_MENU:
                         self.start_level()
                     elif self.result in ("pk_win", "pk_lose", "pk_draw"):
-                        self._go_menu()
+                        # 主按钮：可重连则请求再来一局，否则返回菜单
+                        if self.after_pk is not None:
+                            self._request_rematch()
+                        else:
+                            self._go_menu()
                     elif self.result == "win":
                         self.start_level(inc=True)
                     else:
                         self.start_level(retry=True)
-                elif (self.state == STATE_MENU
-                        and self._overlay_btn2.collidepoint(event.pos)):
-                    self._lan_reset()
-                    self.lan_ip = ""
-                    self.state = STATE_LAN
+                elif self._overlay_btn2.collidepoint(event.pos):
+                    if self.state == STATE_MENU:
+                        self._lan_reset()
+                        self.lan_ip = ""
+                        self.state = STATE_LAN
+                    elif self.result in ("pk_win", "pk_lose", "pk_draw"):
+                        self._go_menu()          # PK 次按钮：返回菜单
                 return True
+            # PK 道具槽
+            if self.pk is not None:
+                for i, rect in enumerate(self._item_slot_rects()):
+                    if rect.collidepoint(event.pos):
+                        self._use_item(ITEM_KEYS[i])
+                        return True
             # 底部按钮
             for rect, _label, action in self._buttons:
                 if rect.collidepoint(event.pos):
@@ -1505,7 +1779,7 @@ class Game:
                 seed = random.randrange(1, 2 ** 31)
                 self.lan_link.send({"t": "start", "seed": seed,
                                     "duration": PK_DURATION})
-                self.start_pk(seed, self.lan_link)
+                self.start_pk(seed, self.lan_link, is_host=True)
                 return
         elif self.lan_mode == "join":
             if self.lan_link is None and L["connect"].collidepoint(pos):
@@ -1570,7 +1844,9 @@ class Game:
         if self.pk is not None:
             remain = max(0, (self.pk["end_ms"] - pygame.time.get_ticks()) // 1000)
             labels = ("对战", "我方", "对方", "时间")
-            values = ("LAN", str(self.score), str(self.pk["opp"]),
+            status = ("领先" if self.score > self.pk["opp"]
+                      else "落后" if self.score < self.pk["opp"] else "平局")
+            values = (status, str(self.score), str(self.pk["opp"]),
                       str(remain))
             # 最后 10 秒红色闪烁
             flash = remain <= 10 and (pygame.time.get_ticks() // 300) % 2 == 0
@@ -1581,6 +1857,15 @@ class Game:
         for i in range(4):
             rect = pygame.Rect(int(x), 48, int(bw), 46)
             self._draw_panel(rect, radius=12)
+            # 对方刚加分：格子亮黄高亮 0.7 秒
+            if self.pk is not None and i == 2:
+                age = pygame.time.get_ticks() - self.pk["opp_flash"]
+                if 0 <= age < 700:
+                    hl = pygame.Surface(rect.size, pygame.SRCALPHA)
+                    hl.fill((255, 210, 80, int(110 * (1 - age / 700))))
+                    self.screen.blit(hl, rect.topleft)
+                    pygame.draw.rect(self.screen, (255, 170, 40), rect,
+                                     3, border_radius=12)
             lb = self.f_stat_label.render(labels[i], True, TEXT_SOFT)
             self.screen.blit(lb, lb.get_rect(center=(rect.centerx, 60)))
             vl = self.f_stat_val.render(values[i], True, val_colors[i])
@@ -1750,6 +2035,120 @@ class Game:
                 self.screen.blit(outline, rect.move(dx, dy))
             self.screen.blit(img, rect)
 
+        # 定时小鬼（画在棋盘最上层）
+        if self.imp:
+            boom_t, rr, cc = self.imp
+            remain = max(0, (boom_t - now_ms) / IMP_MS)
+            x, y = cell_cx(cc), cell_cy(rr)
+            pulse = 1.0 + 0.12 * math.sin(now_ms / 70)
+            r = int(14 * pulse)
+            body = pygame.Surface((r * 4, r * 4), pygame.SRCALPHA)
+            pygame.draw.circle(body, (120, 40, 180, 235), (r * 2, r * 2), r)
+            # 眼睛
+            for sx in (-6, 6):
+                pygame.draw.circle(body, (255, 255, 255),
+                                   (r * 2 + sx, r * 2 - 3), 4)
+                pygame.draw.circle(body, (40, 0, 60),
+                                   (r * 2 + sx, r * 2 - 2), 2)
+            self.screen.blit(body, body.get_rect(center=(int(x), int(y))))
+            # 倒计时圆环（越来越红、越细）
+            rr2 = CELL // 2 - 4
+            col = (255, int(60 + 120 * (1 - remain)), 60)
+            ring = pygame.Surface((rr2 * 2 + 6, rr2 * 2 + 6),
+                                  pygame.SRCALPHA)
+            pygame.draw.circle(ring, col + (255,), (rr2 + 3, rr2 + 3), rr2,
+                               max(2, int(2 + 3 * remain)))
+            self.screen.blit(ring, ring.get_rect(center=(int(x), int(y))))
+
+    # ---------- 道具 UI ----------
+    ITEM_BAR_Y = BOARD_Y + ROWS * CELL + 64
+    ITEM_BAR_H = 34
+
+    def _item_slot_rects(self):
+        gap = 6
+        w = (WIN_W - 16 - gap * 4) / 5
+        return [pygame.Rect(int(8 + i * (w + gap)), self.ITEM_BAR_Y,
+                            int(w), self.ITEM_BAR_H) for i in range(5)]
+
+    def _draw_energy_bar(self):
+        if self.pk is None:
+            return
+        x, y = BOARD_X, BOARD_Y - 8
+        w, h = COLS * CELL, 6
+        pygame.draw.rect(self.screen, (120, 90, 110),
+                         (x - 1, y - 1, w + 2, h + 2), border_radius=4)
+        full = self.energy >= ENERGY_MAX
+        if self.energy > 0:
+            col = (255, 205, 70) if full else (255, 140, 110)
+            fw = int(w * self.energy / ENERGY_MAX)
+            pygame.draw.rect(self.screen, col, (x, y, fw, h),
+                             border_radius=3)
+        if full:
+            lb = self.f_small.render("能量已满，点道具释放", True,
+                                     (255, 205, 70))
+            self.screen.blit(lb, lb.get_rect(midright=(x + w, y - 8)))
+
+    def _draw_item_bar(self):
+        for i, (key, name, theme) in enumerate(ITEM_DEFS):
+            rect = self._item_slot_rects()[i]
+            ready = self._item_ready(key)
+            if key == "shield" and self.shield_held:
+                fill, edge = (90, 180, 255), (255, 255, 255)
+            elif ready:
+                fill = theme
+                edge = (255, 230, 120)
+            else:
+                fill = (160, 155, 170)
+                edge = None
+            pygame.draw.rect(self.screen, fill, rect, border_radius=8)
+            if edge and (pygame.time.get_ticks() // 250) % 2 == 0:
+                pygame.draw.rect(self.screen, edge, rect, 2, border_radius=8)
+            sub = name if not (key == "shield" and self.shield_held) \
+                else "已装备"
+            t = self.f_small.render(sub, True,
+                                    WHITE if ready or self.shield_held
+                                    else (230, 230, 235))
+            self.screen.blit(t, t.get_rect(center=rect.center))
+
+    def _draw_item_fx(self, now_ms):
+        """迷雾 / 糖纸遮罩（在元素与按钮之后绘制）。"""
+        if self.fog_end and now_ms < self.fog_end:
+            fog = pygame.Surface((COLS * CELL, ROWS * CELL), pygame.SRCALPHA)
+            fog.fill((212, 216, 232, 150))
+            for x, y, r in ((60, 80, 26), (280, 200, 32), (150, 330, 22),
+                            (360, 90, 18)):
+                pygame.draw.circle(fog, (255, 255, 255, 40), (x, y), r)
+            self.screen.blit(fog, (BOARD_X, BOARD_Y))
+        if self.paper and now_ms < self.paper[0]:
+            _t, rr, cc = self.paper
+            x = BOARD_X + (cc - 1) * CELL
+            y = BOARD_Y + (rr - 1) * CELL
+            box = pygame.Rect(x, y, CELL * 3, CELL * 3)
+            pygame.draw.rect(self.screen, (255, 235, 245), box,
+                             border_radius=10)
+            pygame.draw.rect(self.screen, (235, 150, 175), box, 4,
+                             border_radius=10)
+            for k in range(-3, 4):
+                p1 = (box.x + max(0, k * 24),
+                      box.bottom - max(0, -k * 24))
+                p2 = (box.x + min(box.w, box.w + k * 24),
+                      box.y + max(0, k * 24))
+                pygame.draw.line(self.screen, (250, 200, 215), p1, p2, 2)
+            t = self.f_panel_title.render("糖", True, (220, 120, 150))
+            self.screen.blit(t, t.get_rect(center=box.center))
+
+        # 横幅
+        if self.banner and now_ms < self.banner[1]:
+            text, _t, col = self.banner
+            ts = self.f_btn.render(text, True, WHITE)
+            w, h = ts.get_width() + 40, 40
+            panel = pygame.Surface((w, h), pygame.SRCALPHA)
+            panel.fill((60, 40, 90, 210))
+            self.screen.blit(panel, panel.get_rect(
+                center=(WIN_W // 2, BOARD_Y + 26)))
+            self.screen.blit(ts, ts.get_rect(
+                center=(WIN_W // 2, BOARD_Y + 26)))
+
     def _draw_buttons(self):
         for rect, label, action in self._buttons:
             if action == "restart":
@@ -1760,9 +2159,21 @@ class Game:
                     label = ("音效:开" if self.sound.on else "音效:关")
             txt = self.f_btn.render(label, True, WHITE)
             self.screen.blit(txt, txt.get_rect(center=rect.center))
-        tip = self.f_small.render("点选两颗相邻糖果交换，也可按住拖动交换",
-                                  True, (255, 255, 255))
-        self.screen.blit(tip, tip.get_rect(center=(WIN_W / 2, WIN_H - 18)))
+        if self.pk is not None:
+            # PK：道具条下方显示剩余次数与操作提示
+            left = MAX_ITEM_USES - self.items_used
+            t1 = self.f_small.render("道具剩余 %d 次" % left, True, WHITE)
+            self.screen.blit(t1, t1.get_rect(midleft=(12, WIN_H - 16)))
+            t2 = self.f_small.render("能量满后点道具释放，护盾自动抵挡",
+                                     True, (255, 245, 220))
+            self.screen.blit(t2, t2.get_rect(midright=(WIN_W - 12,
+                                                        WIN_H - 16)))
+        else:
+            tip = self.f_small.render(
+                "点选两颗相邻糖果交换，也可按住拖动交换",
+                True, (255, 255, 255))
+            self.screen.blit(tip, tip.get_rect(center=(WIN_W / 2,
+                                                        WIN_H - 18)))
 
     def _draw_overlay(self):
         layer = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -1770,7 +2181,11 @@ class Game:
         self.screen.blit(layer, (0, 0))
 
         is_menu = self.state == STATE_MENU
-        panel = pygame.Rect(0, 0, 320, 340 if is_menu else 300)
+        is_pk = self.result in ("pk_win", "pk_lose", "pk_draw")
+        # 菜单 / PK 且可再来一局：面板加高放两个按钮
+        pk_two_btns = is_pk and self.after_pk is not None
+        h = 340 if (is_menu or pk_two_btns) else 300
+        panel = pygame.Rect(0, 0, 320, h)
         panel.center = (WIN_W // 2, WIN_H // 2)
         self._draw_panel(panel, radius=18)
 
@@ -1782,12 +2197,23 @@ class Game:
                 "四连出条纹糖，五连出彩虹糖",
                 "拐角出炸弹糖！"], "开始游戏"
             btn2_label = "局域网对战"
-        elif self.result in ("pk_win", "pk_lose", "pk_draw"):
+        elif is_pk:
             title = {"pk_win": "你赢了！", "pk_lose": "惜败…",
                      "pk_draw": "平局！"}[self.result]
             my, opp = self.pk_final or (self.score, 0)
             lines = ["我方 %d 分" % my, "对方 %d 分" % opp]
-            btn_label = "返回菜单"
+            if pk_two_btns:
+                btn_label, btn2_label = "再来一局", "返回菜单"
+                myr, opr = self.my_rematch, self.after_pk["opp_rematch"]
+                if myr and opr:
+                    lines.append("双方同意，正在开始…")
+                elif myr:
+                    lines.append("已请求，等待对方确认…")
+                elif opr:
+                    lines.append("对方想再来一局！")
+            else:
+                # 对方掉线/离开，无连接，只能返回
+                btn_label = "返回菜单"
         else:
             earned = self.score - self.level_start_score
             if self.result == "win":
@@ -1807,13 +2233,23 @@ class Game:
                                                      panel.y + 108 + i * 30)))
         btn_y = panel.bottom - (116 if btn2_label else 70)
         self._overlay_btn.update(panel.centerx - 100, btn_y, 200, 48)
-        self._draw_button(self._overlay_btn, PURPLE_BTN, (110, 88, 190))
+        # PK 结算主按钮"再来一局"用红色强调；其余场景主按钮紫色
+        if is_pk:
+            main_fill, main_sh = RED, (200, 70, 75)
+        else:
+            main_fill, main_sh = PURPLE_BTN, (110, 88, 190)
+        self._draw_button(self._overlay_btn, main_fill, main_sh)
         bt = self.f_btn.render(btn_label, True, WHITE)
         self.screen.blit(bt, bt.get_rect(center=self._overlay_btn.center))
         if btn2_label:
             self._overlay_btn2.update(panel.centerx - 100, panel.bottom - 60,
                                       200, 44)
-            self._draw_button(self._overlay_btn2, RED, (200, 70, 75))
+            # PK 次按钮"返回菜单"用紫色；菜单次按钮红色
+            if is_pk:
+                sub_fill, sub_sh = PURPLE_BTN, (110, 88, 190)
+            else:
+                sub_fill, sub_sh = RED, (200, 70, 75)
+            self._draw_button(self._overlay_btn2, sub_fill, sub_sh)
             bt2 = self.f_btn.render(btn2_label, True, WHITE)
             self.screen.blit(bt2, bt2.get_rect(center=self._overlay_btn2.center))
 
@@ -1881,8 +2317,12 @@ class Game:
             self._draw_lan(now_ms)
         else:
             self._draw_hud()
+            self._draw_energy_bar()
             self._draw_board(now_ms)
             self._draw_buttons()
+            if self.pk is not None:
+                self._draw_item_bar()
+            self._draw_item_fx(now_ms)
             if self.state in (STATE_MENU, STATE_OVER):
                 self._draw_overlay()
         pygame.display.flip()
@@ -1898,7 +2338,12 @@ class Game:
             self.handle_mouse()
             if self.state == STATE_LAN:
                 self._poll_lan()
+            elif self.state == STATE_OVER:
+                self._poll_rematch()
             self._poll_pk()
+            if self.state == STATE_PLAY:
+                self._process_item_timing()
+                self._update_idle_tw(dt)
             self._update_gen(dt)
             self._update_effects(dt)
             self.draw(pygame.time.get_ticks())
