@@ -79,7 +79,8 @@ STATE_OVER = "over"
 STATE_LAN = "lan"            # 局域网对战连接界面
 
 LAN_PORT = 50007             # 局域网对战 TCP 端口
-PK_DURATION = 90             # 对战时长（秒）
+PK_DURATION = 90             # 默认对战时长（秒）
+DURATION_PRESETS = (60, 90, 120, 180)   # 主机可选时长（秒）
 
 # ---- 干扰道具 ----
 MAX_ITEM_USES = 5            # 每人每局道具使用上限
@@ -812,6 +813,7 @@ class Game:
         self.lan_srv = None         # 建房监听 socket
         self.lan_link = None        # 已建立、尚未开赛的连接
         self._lan_q = queue.Queue() # accept/join 异步结果
+        self.pk_duration = PK_DURATION  # 本局选定的对战时长
 
         # 道具与受影响效果
         self.energy = 0             # 0..ENERGY_MAX
@@ -1003,8 +1005,11 @@ class Game:
         except OSError:
             self._lan_q.put(("err", "连接失败，请检查 IP 或确认对方已建房", None))
 
-    def start_pk(self, seed, link, is_host=False):
-        """双方用同一种子建相同棋盘，90 秒限时比分。"""
+    def start_pk(self, seed, link, is_host=False, duration=None):
+        """双方用同一种子建相同棋盘，duration 秒限时比分。"""
+        duration = int(duration) if duration else PK_DURATION
+        # 防御异常时长（网络消息可能被篡改）
+        duration = max(15, min(600, duration))
         random.seed(seed)
         self.score = 0
         self.level_start_score = 0
@@ -1017,8 +1022,9 @@ class Game:
         self.waves = []
         self.board = Board()
         self.pk = {"link": link, "opp": 0, "seed": seed,
-                   "is_host": is_host, "opp_flash": -10 ** 9,
-                   "end_ms": pygame.time.get_ticks() + PK_DURATION * 1000}
+                   "is_host": is_host, "dur": duration,
+                   "opp_flash": -10 ** 9,
+                   "end_ms": pygame.time.get_ticks() + duration * 1000}
         self._pk_sent = -1
         self.pk_final = None
         self.after_pk = None
@@ -1048,6 +1054,7 @@ class Game:
             return
         my, opp = self.score, self.pk["opp"]
         is_host = self.pk.get("is_host", False)
+        dur = self.pk.get("dur", PK_DURATION)
         if result is None:
             result = ("pk_win" if my > opp
                       else "pk_lose" if my < opp else "pk_draw")
@@ -1059,7 +1066,7 @@ class Game:
             # 正常结算：发 end（带最终分数），连接保留到 after_pk
             link.send({"t": "end", "score": my})
             self.after_pk = {"link": link, "is_host": is_host,
-                             "opp_rematch": False}
+                             "dur": dur, "opp_rematch": False}
             self.my_rematch = False
         else:
             # 对方已离开：直接关闭
@@ -1129,7 +1136,10 @@ class Game:
         for m in self.lan_link.poll():
             t = m.get("t")
             if t == "start" and self.lan_mode == "join":
-                self.start_pk(int(m.get("seed", 0)), self.lan_link)
+                dur = int(m.get("duration", PK_DURATION))
+                self.pk_duration = max(15, min(600, dur))
+                self.start_pk(int(m.get("seed", 0)), self.lan_link,
+                              duration=self.pk_duration)
                 return
             if t in ("bye", "_closed"):
                 self.lan_link.close()
@@ -1266,8 +1276,9 @@ class Game:
             elif t == "start":
                 # 主机在双方同意后发来新种子 → 直接开新局
                 seed = int(m.get("seed", 0))
+                dur = int(m.get("duration", PK_DURATION))
                 self.after_pk = None
-                self.start_pk(seed, link)                  # 客户端 is_host=False
+                self.start_pk(seed, link, duration=dur)   # 客户端 is_host=False
                 return
             elif t in ("bye", "_closed"):
                 # 对方选择结束：关闭连接，结算页只剩"返回菜单"
@@ -1280,10 +1291,11 @@ class Game:
                 and self.my_rematch
                 and self.after_pk["opp_rematch"]):
             seed = random.randrange(1, 2 ** 31)
+            dur = self.after_pk["dur"]
             link.send({"t": "start", "seed": seed,
-                       "duration": PK_DURATION})
+                       "duration": dur})
             self.after_pk = None
-            self.start_pk(seed, link, is_host=True)
+            self.start_pk(seed, link, is_host=True, duration=dur)
 
     def _go_menu(self):
         """结束对战/连接，回到主菜单。"""
@@ -1742,8 +1754,14 @@ class Game:
 
     # ---------- LAN 界面 ----------
     def _lan_layout(self):
-        panel = pygame.Rect(0, 0, 360, 330)
+        panel = pygame.Rect(0, 0, 360, 380)
         panel.center = (WIN_W // 2, WIN_H // 2)
+        # 主机时长选择：4 个小按钮一行
+        bw = 76
+        gap = (panel.w - 40 - bw * 4) / 3
+        dur_btns = [pygame.Rect(panel.x + 20 + i * (bw + gap),
+                                panel.y + 168, bw, 32)
+                    for i in range(4)]
         return {
             "panel": panel,
             "host": pygame.Rect(panel.centerx - 100, panel.y + 120, 200, 44),
@@ -1752,6 +1770,7 @@ class Game:
             "go": pygame.Rect(panel.centerx - 100, panel.bottom - 106, 200, 44),
             "input": pygame.Rect(panel.x + 40, panel.y + 116, panel.w - 80, 42),
             "connect": pygame.Rect(panel.centerx - 100, panel.y + 168, 200, 44),
+            "dur_btns": dur_btns,
         }
 
     def _lan_connect(self):
@@ -1775,11 +1794,17 @@ class Game:
                 self.lan_mode = "join"
                 self.lan_status = "输入主机 IP 后点击连接"
         elif self.lan_mode == "host":
+            # 时长选择（开赛前随时可改）
+            for i, rect in enumerate(L["dur_btns"]):
+                if rect.collidepoint(pos):
+                    self.pk_duration = DURATION_PRESETS[i]
+                    return
             if self.lan_link is not None and L["go"].collidepoint(pos):
                 seed = random.randrange(1, 2 ** 31)
                 self.lan_link.send({"t": "start", "seed": seed,
-                                    "duration": PK_DURATION})
-                self.start_pk(seed, self.lan_link, is_host=True)
+                                    "duration": self.pk_duration})
+                self.start_pk(seed, self.lan_link, is_host=True,
+                              duration=self.pk_duration)
                 return
         elif self.lan_mode == "join":
             if self.lan_link is None and L["connect"].collidepoint(pos):
@@ -2264,8 +2289,13 @@ class Game:
 
         tt = self.f_panel_title.render("局域网对战", True, TEXT_DARK)
         self.screen.blit(tt, tt.get_rect(center=(panel.centerx, panel.y + 42)))
-        sub = self.f_small.render(
-            "双方同棋盘，%d 秒内得分高者胜" % PK_DURATION, True, TEXT_SOFT)
+        if self.lan_mode == "join":
+            sub_text = "双方同棋盘，对局时长由主机设置"
+        else:
+            shown_dur = (self.pk_duration if self.lan_mode == "host"
+                         else PK_DURATION)
+            sub_text = "双方同棋盘，%d 秒内得分高者胜" % shown_dur
+        sub = self.f_small.render(sub_text, True, TEXT_SOFT)
         self.screen.blit(sub, sub.get_rect(center=(panel.centerx, panel.y + 74)))
 
         if self.lan_mode is None:
@@ -2277,7 +2307,21 @@ class Game:
             ip = self.f_panel_text.render("本机 IP：%s（告诉对方）"
                                           % get_lan_ip(), True, TEXT_DARK)
             self.screen.blit(ip, ip.get_rect(center=(panel.centerx,
-                                                     panel.y + 120)))
+                                                     panel.y + 118)))
+            # 时长选择
+            dl = self.f_small.render("对局时长", True, TEXT_DARK)
+            self.screen.blit(dl, dl.get_rect(center=(panel.centerx,
+                                                     panel.y + 148)))
+            for i, rect in enumerate(L["dur_btns"]):
+                sel = DURATION_PRESETS[i] == self.pk_duration
+                if sel:
+                    fill, sh = RED, (200, 70, 75)
+                else:
+                    fill, sh = PURPLE_BTN, (110, 88, 190)
+                self._draw_button(rect, fill, sh, radius=8)
+                bt = self.f_small.render(
+                    "%d 秒" % DURATION_PRESETS[i], True, WHITE)
+                self.screen.blit(bt, bt.get_rect(center=rect.center))
             if self.lan_link is not None:
                 self._draw_button(L["go"], RED, (200, 70, 75))
                 bt = self.f_btn.render("开始对战", True, WHITE)
