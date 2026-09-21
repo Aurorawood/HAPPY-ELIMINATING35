@@ -77,6 +77,7 @@ STATE_MENU = "menu"
 STATE_PLAY = "play"
 STATE_OVER = "over"
 STATE_LAN = "lan"            # 局域网对战连接界面
+STATE_PAUSE = "pause"        # 游戏暂停
 
 LAN_PORT = 50007             # 局域网对战 TCP 端口
 PK_DURATION = 90             # 默认对战时长（秒）
@@ -174,6 +175,17 @@ def in_bounds(r, c):
     return 0 <= r < ROWS and 0 <= c < COLS
 
 
+# ============================================================
+#  背景音乐配置
+#  把你的音乐文件完整路径填进 BGM_PATH 的引号里，例如：
+#      BGM_PATH = r"C:\Users\asus\Music\bgm.mp3"
+#  支持 mp3 / ogg / wav；留着 "" 则不播放背景音乐。
+#  也可以直接把音乐文件放进游戏目录并写文件名，如 BGM_PATH = "bgm.mp3"
+# ============================================================
+BGM_PATH = r""
+BGM_VOLUME = 0.35          # 背景音乐音量 0.0 ~ 1.0
+
+
 # ==================== 音效（无外部文件，实时合成） ====================
 class SoundManager:
     SR = 22050
@@ -187,6 +199,9 @@ class SoundManager:
             self.ok = True
         except pygame.error:
             self.ok = False  # 没有音频设备时静默降级
+        # 背景音乐状态
+        self.bgm_loaded = False
+        self._bgm_resolved = None   # 已加载的实际路径（防重复 load）
 
     def _build(self, name, notes):
         """notes: [(频率, 起始秒, 时长秒, 波形, 音量), ...] 合成为一个 Sound。"""
@@ -267,6 +282,70 @@ class SoundManager:
                  for i, f in enumerate((420, 330, 240))]
         self._build("lose", notes)
         self.play("lose")
+
+    # ---------- 背景音乐 ----------
+    def load_bgm(self, path):
+        """加载背景音乐；路径为空/文件不存在/格式不支持时静默跳过。"""
+        if not self.ok:
+            return False
+        path = (path or "").strip()
+        if not path:
+            self.bgm_loaded = False
+            return False
+        # 相对路径基于游戏脚本所在目录解析
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                path)
+        if not os.path.isfile(path):
+            self.bgm_loaded = False
+            return False
+        if path == self._bgm_resolved and self.bgm_loaded:
+            return True                    # 同一文件不重复加载，避免切场景断音
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(BGM_VOLUME)
+        except pygame.error:
+            self.bgm_loaded = False
+            return False
+        self._bgm_resolved = path
+        self.bgm_loaded = True
+        return True
+
+    def play_bgm(self):
+        """循环播放（已在播放则不打断）。"""
+        if not (self.on and self.ok and self.bgm_loaded):
+            return
+        try:
+            if not pygame.mixer.music.get_busy():
+                pygame.mixer.music.play(-1)
+        except pygame.error:
+            pass
+
+    def stop_bgm(self):
+        if not self.ok:
+            return
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+
+    def pause_bgm(self):
+        if not self.ok:
+            return
+        try:
+            pygame.mixer.music.pause()
+        except pygame.error:
+            pass
+
+    def unpause_bgm(self):
+        if not (self.ok and self.bgm_loaded):
+            return
+        try:
+            pygame.mixer.music.unpause()
+            if not pygame.mixer.music.get_busy():
+                pygame.mixer.music.play(-1)
+        except pygame.error:
+            pass
 
 
 # ==================== 棋盘规则类 ====================
@@ -792,12 +871,19 @@ class Game:
         self.f_panel_title = font(26, True)
         self.f_panel_text = font(15)
         self.f_small = font(12)
+        self.f_home_title = font(40, True)
+        self.f_home_sub = font(14)
+        self.f_home_btn = font(19, True)
 
         self.art = ImageArt(IMAGE_DIR)
         self.sound = SoundManager()
         self.sound.on = self._load_sound_pref()
+        # 加载并播放背景音乐（路径未配置时自动跳过）
+        if self.sound.load_bgm(BGM_PATH):
+            self.sound.play_bgm()
 
-        self.best = self._load_best()
+        self.best, self.best_endless = self._load_best()
+        self.game_mode = "level"      # "level" 关卡模式 / "endless" 无尽模式
         self.state = STATE_MENU
         self.result = None
 
@@ -848,7 +934,12 @@ class Game:
         self._overlay_btn = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 80, 200, 48)
         self._overlay_btn2 = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 136,
                                          200, 44)
+        self._overlay_btn3 = pygame.Rect(WIN_W // 2 - 100, WIN_H // 2 + 192,
+                                         200, 44)
+        # 游戏内右上角"菜单"按钮（暂停入口；PK 中不显示）
+        self._menu_btn = pygame.Rect(WIN_W - 62, 12, 50, 26)
         self._buttons = self._build_buttons()
+        self._home = self._build_home()
         self._bg_surf = self._render_background()
         # 启动落入动画（菜单界面即可看到动物落位）
         self._start_gen(self._flow_init())
@@ -897,16 +988,20 @@ class Game:
 
     # ---------- 持久化 ----------
     def _load_best(self):
+        """返回 (关卡模式历史最佳总分, 无尽模式最佳得分)。"""
         try:
             with open(self.BEST_FILE, "r", encoding="utf-8") as f:
-                return int(json.load(f).get("best", 0))
+                data = json.load(f)
+            return (int(data.get("best", 0)),
+                    int(data.get("endless", 0)))
         except (OSError, ValueError):
-            return 0
+            return 0, 0
 
     def _save_best(self):
         try:
             with open(self.BEST_FILE, "w", encoding="utf-8") as f:
-                json.dump({"best": self.best}, f)
+                json.dump({"best": self.best,
+                           "endless": self.best_endless}, f)
         except OSError:
             pass
 
@@ -934,13 +1029,14 @@ class Game:
         x = 12
         for label, action in (("重开本关", "restart"),
                               ("提示", "hint"),
-                              ("音效:开", "sound")):
+                              ("声音:开", "sound")):
             rects.append((pygame.Rect(int(x), y, int(bw), 42), label, action))
             x += bw + 8
         return rects
 
     # ---------- 关卡控制 ----------
     def start_level(self, inc=False, retry=False):
+        self.game_mode = "level"
         if inc:
             self.level += 1
         if retry:
@@ -948,6 +1044,26 @@ class Game:
         self.level_start_score = self.score
         self.moves = 20 + min(8, (self.level - 1) * 2)
         self.target = round(1200 * 1.45 ** (self.level - 1))
+
+        self.selected = None
+        self.drag = None
+        self.hint = None
+        self.particles = []
+        self.floats = []
+        self.beams = []
+        self.waves = []
+        self.board = Board()
+        self.state = STATE_PLAY
+        self._start_gen(self._flow_init())
+
+    def start_endless(self):
+        """无尽模式：无步数/目标限制，死局自动洗牌，仅可主动退出。"""
+        self.game_mode = "endless"
+        self.level = 1
+        self.score = 0
+        self.level_start_score = 0
+        self.moves = -1               # -1 表示无限
+        self.target = 0
 
         self.selected = None
         self.drag = None
@@ -1298,7 +1414,12 @@ class Game:
             self.start_pk(seed, link, is_host=True, duration=dur)
 
     def _go_menu(self):
-        """结束对战/连接，回到主菜单。"""
+        """结束对战/连接，回到主页。"""
+        # 无尽模式退出：保存本次最佳
+        if self.game_mode == "endless" and self.pk is None:
+            if self.score > self.best_endless:
+                self.best_endless = self.score
+                self._save_best()
         # 结算后保留的连接：通知对方本方结束
         if self.after_pk is not None:
             link = self.after_pk["link"]
@@ -1309,9 +1430,50 @@ class Game:
         self._lan_reset()
         self.result = None
         self.pk_final = None
+        self.game_mode = "level"
         self.board = Board()
         self.state = STATE_MENU
         self._start_gen(self._flow_init())
+        self.sound.unpause_bgm()        # 主页继续播放背景音乐
+
+    # ---------- 暂停 ----------
+    def _pause_game(self):
+        """暂停：记录时刻。所有 dt 驱动（tween/gen/特效）在主循环中停止推进。"""
+        if self.state != STATE_PLAY or self.pk is not None:
+            return                      # PK 中不允许暂停
+        self._pause_start = pygame.time.get_ticks()
+        self.state = STATE_PAUSE
+        self.sound.pause_bgm()           # 背景音乐一并暂停
+
+    def _resume_game(self):
+        """恢复：把暂停期间经过的时间补偿到所有绝对时间戳。"""
+        if self.state != STATE_PAUSE:
+            return
+        shift = pygame.time.get_ticks() - self._pause_start
+        if shift > 0:
+            if self.hint is not None:
+                self.hint = self.hint[:4] + (self.hint[4] + shift,)
+            if self.banner is not None:
+                self.banner = (self.banner[0], self.banner[1] + shift,
+                               self.banner[2])
+            if self.fog_end:
+                self.fog_end += shift
+            if self.paper is not None:
+                self.paper = (self.paper[0] + shift, self.paper[1],
+                              self.paper[2])
+            if self.imp is not None:
+                self.imp = (self.imp[0] + shift, self.imp[1], self.imp[2])
+        self.state = STATE_PLAY
+        self.sound.unpause_bgm()
+
+    def _pause_restart(self):
+        """暂停面板：重新开始当前关卡/无尽局。"""
+        mode = self.game_mode
+        if mode == "endless":
+            self.start_endless()
+        else:
+            self.start_level(retry=True)
+        self.sound.unpause_bgm()        # 重开后恢复音乐
 
     # ---------- 生成器驱动 ----------
     def _start_gen(self, gen):
@@ -1551,7 +1713,8 @@ class Game:
             swap_keys = set()
 
         # 无更多匹配 → 回合结束判定
-        if self.pk is None:                 # PK 模式无目标/步数限制，计时统一结算
+        # 仅关卡模式有目标/步数；PK 走计时；无尽模式永不结束
+        if self.pk is None and self.game_mode == "level":
             earned = self.score - self.level_start_score
             if earned >= self.target:
                 self._game_over(True)
@@ -1665,10 +1828,16 @@ class Game:
             self._lan_reset()
             return False
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            if self.state == STATE_PAUSE:
+                self._resume_game()          # 暂停时 ESC 继续游戏
+                return True
             if self.pk is not None or self.state == STATE_LAN:
                 self._go_menu()
                 return True
             if self.after_pk is not None:
+                self._go_menu()
+                return True
+            if self.state == STATE_PLAY:     # 关卡/无尽：返回主页
                 self._go_menu()
                 return True
             self._pk_cleanup()
@@ -1689,17 +1858,45 @@ class Game:
             return True
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # 暂停面板
+            if self.state == STATE_PAUSE:
+                if self._overlay_btn.collidepoint(event.pos):
+                    self._resume_game()
+                elif self._overlay_btn2.collidepoint(event.pos):
+                    self._pause_restart()
+                elif self._overlay_btn3.collidepoint(event.pos):
+                    self._go_menu()
+                return True
             # LAN 界面按钮
             if self.state == STATE_LAN:
                 self._lan_click(event.pos)
                 return True
-            # 菜单 / 结束面板的按钮
-            if self.state in (STATE_MENU, STATE_OVER):
+            # 游戏内"菜单"按钮（最优先，动画中也可点）
+            if (self.state == STATE_PLAY and self.pk is None
+                    and self._menu_btn.collidepoint(event.pos)):
+                self._pause_game()
+                return True
+            # 主页：三个模式入口
+            if self.state == STATE_MENU:
+                for rect, mode, _t, _d, _f, _s in self._home["btns"]:
+                    if rect.collidepoint(event.pos):
+                        if mode == "level":
+                            self.level = 1
+                            self.score = 0
+                            self.start_level()
+                        elif mode == "endless":
+                            self.start_endless()
+                        else:                   # 好友对战
+                            self._lan_reset()
+                            self.lan_ip = ""
+                            self.state = STATE_LAN
+                        break
+                return True
+            # 结束面板的按钮
+            if self.state == STATE_OVER:
                 if self._overlay_btn.collidepoint(event.pos):
-                    if self.state == STATE_MENU:
-                        self.start_level()
-                    elif self.result in ("pk_win", "pk_lose", "pk_draw"):
-                        # 主按钮：可重连则请求再来一局，否则返回菜单
+                    if self.result in ("pk_win", "pk_lose", "pk_draw"):
+                        # 主按钮：可重连则请求再来一局，否则返回主页
                         if self.after_pk is not None:
                             self._request_rematch()
                         else:
@@ -1709,12 +1906,7 @@ class Game:
                     else:
                         self.start_level(retry=True)
                 elif self._overlay_btn2.collidepoint(event.pos):
-                    if self.state == STATE_MENU:
-                        self._lan_reset()
-                        self.lan_ip = ""
-                        self.state = STATE_LAN
-                    elif self.result in ("pk_win", "pk_lose", "pk_draw"):
-                        self._go_menu()          # PK 次按钮：返回菜单
+                    self._go_menu()          # 次按钮：返回主页
                 return True
             # PK 道具槽
             if self.pk is not None:
@@ -1740,7 +1932,10 @@ class Game:
         if action == "restart":
             if self.pk is not None:
                 return                  # 对战中不可重开
-            self.start_level(retry=True)
+            if self.game_mode == "endless":
+                self.start_endless()
+            else:
+                self.start_level(retry=True)
         elif action == "hint":
             h = self.board.find_hint()
             if h:
@@ -1751,6 +1946,9 @@ class Game:
             self._save_sound_pref()
             if self.sound.on:
                 self.sound.swap_s()
+                self.sound.play_bgm()
+            else:
+                self.sound.stop_bgm()
 
     # ---------- LAN 界面 ----------
     def _lan_layout(self):
@@ -1864,8 +2062,14 @@ class Game:
                                 (222, 120, 110), (WIN_W // 2, 25))
 
         labels = ("关卡", "分数", "最佳", "步数")
-        values = (str(self.level), str(self.score), str(self.best), str(self.moves))
+        values = (str(self.level), str(self.score), str(self.best),
+                  str(self.moves))
         val_colors = (TEXT_DARK, TEXT_DARK, TEXT_DARK, RED)
+        if self.game_mode == "endless" and self.pk is None:
+            labels = ("模式", "分数", "最佳", "步数")
+            values = ("无尽", str(self.score), str(self.best_endless),
+                      "无限")
+            val_colors = (TEXT_DARK, TEXT_DARK, TEXT_DARK, TEXT_DARK)
         if self.pk is not None:
             remain = max(0, (self.pk["end_ms"] - pygame.time.get_ticks()) // 1000)
             labels = ("对战", "我方", "对方", "时间")
@@ -1919,6 +2123,21 @@ class Game:
                                  border_radius=6)
             vs = self.f_small.render("%d : %d" % (my, opp), True, TEXT_DARK)
             self.screen.blit(vs, vs.get_rect(
+                midright=(in_x + in_w - 10, in_y + in_h // 2)))
+        elif self.game_mode == "endless":
+            # 无尽模式：进度表示当前分相对历史最佳纪录
+            pygame.draw.rect(self.screen, PROGRESS_BG,
+                             (in_x, in_y, in_w, in_h), border_radius=in_h // 2)
+            best = max(self.best_endless, 1)
+            pct = max(0, min(1, self.score / best))
+            if pct > 0:
+                fw = max(in_h, int(in_w * pct))
+                pygame.draw.rect(self.screen, (255, 170, 70),
+                                 (in_x, in_y, fw, in_h),
+                                 border_radius=in_h // 2)
+            lb = self.f_small.render(
+                "无尽模式 · 纪录 %d" % self.best_endless, True, TEXT_DARK)
+            self.screen.blit(lb, lb.get_rect(
                 midright=(in_x + in_w - 10, in_y + in_h // 2)))
         else:
             pygame.draw.rect(self.screen, PROGRESS_BG,
@@ -2178,10 +2397,12 @@ class Game:
         for rect, label, action in self._buttons:
             if action == "restart":
                 self._draw_button(rect, RED, (200, 70, 75))
+                if self.game_mode == "endless":
+                    label = "重新开始"
             else:
                 self._draw_button(rect, PURPLE_BTN, (110, 88, 190))
                 if action == "sound":
-                    label = ("音效:开" if self.sound.on else "音效:关")
+                    label = ("声音:开" if self.sound.on else "声音:关")
             txt = self.f_btn.render(label, True, WHITE)
             self.screen.blit(txt, txt.get_rect(center=rect.center))
         if self.pk is not None:
@@ -2194,41 +2415,121 @@ class Game:
             self.screen.blit(t2, t2.get_rect(midright=(WIN_W - 12,
                                                         WIN_H - 16)))
         else:
-            tip = self.f_small.render(
-                "点选两颗相邻糖果交换，也可按住拖动交换",
-                True, (255, 255, 255))
+            if self.game_mode == "endless":
+                tip_text = "无尽模式：不限步数，按 ESC 返回主页"
+            else:
+                tip_text = "点选两颗相邻糖果交换，也可按住拖动交换"
+            tip = self.f_small.render(tip_text, True, (255, 255, 255))
             self.screen.blit(tip, tip.get_rect(center=(WIN_W / 2,
                                                         WIN_H - 18)))
+
+    # ---------- 主页 ----------
+    def _build_home(self):
+        """主页三个入口（Rect 只定义一次，绘制与点击共用）。"""
+        btn_w, btn_h, y0, gap = 320, 84, 316, 18
+        defs = (
+            ("level", "关卡模式", "限定步数内达成目标，逐级挑战",
+             PURPLE_BTN, (110, 88, 190)),
+            ("friend", "好友对战", "局域网实时 PK，一决高下",
+             RED, (200, 70, 75)),
+            ("endless", "无尽模式", "无步数限制，冲击最高分",
+             (70, 178, 160), (45, 140, 125)),
+        )
+        btns = []
+        for i, (mode, title, desc, fill, sh) in enumerate(defs):
+            rect = pygame.Rect(0, 0, btn_w, btn_h)
+            rect.center = (WIN_W // 2, y0 + i * (btn_h + gap))
+            btns.append((rect, mode, title, desc, fill, sh))
+        # 标题下方六种动物小头像（预渲染缓存）
+        faces = [pygame.transform.smoothscale(
+            self.art._imgs[None][False][t], (52, 52))
+            for t in range(TYPES)]
+        return {"btns": btns, "faces": faces}
+
+    def _draw_home(self, now_ms):
+        # 大标题（白字粉描边，轻微上下浮动）
+        bob = math.sin(now_ms / 500) * 4
+        self._blit_text_outline(self.f_home_title, "消 消 乐", WHITE,
+                                (230, 110, 130),
+                                (WIN_W // 2, 118 + bob), offset=3)
+        sub = self.f_home_sub.render("三种玩法，任你选择", True, WHITE)
+        self.screen.blit(sub, sub.get_rect(center=(WIN_W // 2, 172 + bob)))
+        # 动物一排（错落浮动）
+        fw, gap2 = 52, 8
+        total = TYPES * fw + (TYPES - 1) * gap2
+        x0 = (WIN_W - total) // 2
+        for i, face in enumerate(self._home["faces"]):
+            yy = 212 + math.sin(now_ms / 300 + i) * 5
+            self.screen.blit(face, (x0 + i * (fw + gap2), int(yy)))
+        # 三个入口按钮
+        for rect, mode, title, desc, fill, sh in self._home["btns"]:
+            self._draw_button(rect, fill, sh, radius=16)
+            tt = self.f_home_btn.render(title, True, WHITE)
+            self.screen.blit(tt, tt.get_rect(
+                center=(rect.centerx, rect.y + 28)))
+            dd = self.f_small.render(desc, True, (255, 240, 245))
+            self.screen.blit(dd, dd.get_rect(
+                center=(rect.centerx, rect.y + 58)))
+        # 底部历史最佳
+        info = self.f_small.render(
+            "关卡最佳 %d · 无尽最佳 %d" % (self.best, self.best_endless),
+            True, WHITE)
+        self.screen.blit(info, info.get_rect(
+            center=(WIN_W // 2, WIN_H - 26)))
+
+    def _draw_menu_btn(self):
+        """游戏内右上角菜单按钮。"""
+        rect = self._menu_btn
+        self._draw_button(rect, (255, 255, 255), (210, 195, 215), radius=8)
+        bt = self.f_small.render("菜单", True, (210, 90, 110))
+        self.screen.blit(bt, bt.get_rect(center=rect.center))
+
+    def _draw_pause(self):
+        """暂停面板：继续游戏 / 重新开始关卡 / 返回主页。"""
+        layer = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        layer.fill((90, 60, 110, 160))
+        self.screen.blit(layer, (0, 0))
+
+        panel = pygame.Rect(0, 0, 320, 268)
+        panel.center = (WIN_W // 2, WIN_H // 2)
+        self._draw_panel(panel, radius=18)
+
+        tt = self.f_panel_title.render("游戏已暂停", True, TEXT_DARK)
+        self.screen.blit(tt, tt.get_rect(center=(panel.centerx, panel.y + 46)))
+
+        defs = (("继续游戏", RED, (200, 70, 75)),
+                ("重新开始关卡" if self.game_mode == "level"
+                 else "重新开始", PURPLE_BTN, (110, 88, 190)),
+                ("返回主页", (175, 160, 185), (140, 125, 150)))
+        for i, (label, fill, sh) in enumerate(defs):
+            rect = (self._overlay_btn, self._overlay_btn2,
+                    self._overlay_btn3)[i]
+            rect.update(panel.centerx - 100, panel.y + 80 + i * 52, 200, 44)
+            self._draw_button(rect, fill, sh)
+            bt = self.f_btn.render(label, True, WHITE)
+            self.screen.blit(bt, bt.get_rect(center=rect.center))
 
     def _draw_overlay(self):
         layer = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         layer.fill((120, 60, 80, 150))
         self.screen.blit(layer, (0, 0))
 
-        is_menu = self.state == STATE_MENU
         is_pk = self.result in ("pk_win", "pk_lose", "pk_draw")
-        # 菜单 / PK 且可再来一局：面板加高放两个按钮
+        # PK 且可再来一局、或关卡结算（主+次按钮）：加高面板
         pk_two_btns = is_pk and self.after_pk is not None
-        h = 340 if (is_menu or pk_two_btns) else 300
+        h = 340 if (pk_two_btns or self.result in ("win", "lose")) else 300
         panel = pygame.Rect(0, 0, 320, h)
         panel.center = (WIN_W // 2, WIN_H // 2)
         self._draw_panel(panel, radius=18)
 
         btn2_label = None
-        if is_menu:
-            title, lines, btn_label = "欢迎来玩消消乐", [
-                "交换相邻糖果，凑成三个或更多",
-                "同色即可消除",
-                "四连出条纹糖，五连出彩虹糖",
-                "拐角出炸弹糖！"], "开始游戏"
-            btn2_label = "局域网对战"
-        elif is_pk:
+        if is_pk:
             title = {"pk_win": "你赢了！", "pk_lose": "惜败…",
                      "pk_draw": "平局！"}[self.result]
             my, opp = self.pk_final or (self.score, 0)
             lines = ["我方 %d 分" % my, "对方 %d 分" % opp]
             if pk_two_btns:
-                btn_label, btn2_label = "再来一局", "返回菜单"
+                btn_label, btn2_label = "再来一局", "返回主页"
                 myr, opr = self.my_rematch, self.after_pk["opp_rematch"]
                 if myr and opr:
                     lines.append("双方同意，正在开始…")
@@ -2238,15 +2539,17 @@ class Game:
                     lines.append("对方想再来一局！")
             else:
                 # 对方掉线/离开，无连接，只能返回
-                btn_label = "返回菜单"
+                btn_label = "返回主页"
         else:
             earned = self.score - self.level_start_score
             if self.result == "win":
                 title, btn_label = "恭喜过关！", "下一关"
+                btn2_label = "返回主页"
                 lines = ["本关得分 %d" % earned,
                          "累计总分 %d" % self.score]
             else:
                 title, btn_label = "步数用完啦", "再试一次"
+                btn2_label = "返回主页"
                 lines = ["本关得分 %d" % earned,
                          "目标 %d，再试一次吧" % self.target]
 
@@ -2258,8 +2561,8 @@ class Game:
                                                      panel.y + 108 + i * 30)))
         btn_y = panel.bottom - (116 if btn2_label else 70)
         self._overlay_btn.update(panel.centerx - 100, btn_y, 200, 48)
-        # PK 结算主按钮"再来一局"用红色强调；其余场景主按钮紫色
-        if is_pk:
+        # PK 有连接：红色"再来一局"；其余主按钮紫色
+        if pk_two_btns:
             main_fill, main_sh = RED, (200, 70, 75)
         else:
             main_fill, main_sh = PURPLE_BTN, (110, 88, 190)
@@ -2269,7 +2572,7 @@ class Game:
         if btn2_label:
             self._overlay_btn2.update(panel.centerx - 100, panel.bottom - 60,
                                       200, 44)
-            # PK 次按钮"返回菜单"用紫色；菜单次按钮红色
+            # PK 次按钮紫色；关卡次按钮红色
             if is_pk:
                 sub_fill, sub_sh = PURPLE_BTN, (110, 88, 190)
             else:
@@ -2351,7 +2654,7 @@ class Game:
                                                      panel.bottom - 132)))
 
         self._draw_button(L["back"], (200, 180, 190), (170, 145, 155))
-        bt = self.f_small.render("返回菜单", True, WHITE)
+        bt = self.f_small.render("返回主页", True, WHITE)
         self.screen.blit(bt, bt.get_rect(center=L["back"].center))
 
     def draw(self, now_ms):
@@ -2359,6 +2662,8 @@ class Game:
         if self.state == STATE_LAN:
             self._draw_board(now_ms)
             self._draw_lan(now_ms)
+        elif self.state == STATE_MENU:
+            self._draw_home(now_ms)
         else:
             self._draw_hud()
             self._draw_energy_bar()
@@ -2367,8 +2672,13 @@ class Game:
             if self.pk is not None:
                 self._draw_item_bar()
             self._draw_item_fx(now_ms)
-            if self.state in (STATE_MENU, STATE_OVER):
+            if self.state == STATE_OVER:
                 self._draw_overlay()
+            elif self.state == STATE_PAUSE:
+                self._draw_pause()
+            if (self.state in (STATE_PLAY, STATE_PAUSE)
+                    and self.pk is None):
+                self._draw_menu_btn()
         pygame.display.flip()
 
     # ==================== 主循环 ====================
@@ -2379,6 +2689,10 @@ class Game:
                 if self.handle_event(event) is False:
                     pygame.quit()
                     return
+            # 暂停态：只处理事件与绘制，不推进任何逻辑
+            if self.state == STATE_PAUSE:
+                self.draw(pygame.time.get_ticks())
+                continue
             self.handle_mouse()
             if self.state == STATE_LAN:
                 self._poll_lan()
